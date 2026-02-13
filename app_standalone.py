@@ -407,7 +407,7 @@ class Application(tk.Tk):
 
         ttk.Label(
             settings_frame,
-            text='(Bos = otomatik ara, ornek: "Joint Load Cap/table")',
+            text='(Bos = otomatik ara, ornek: "JOINT_LOADS_CAP/table")',
             foreground="gray",
         ).grid(row=2, column=1, columnspan=3, sticky="w")
 

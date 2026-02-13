@@ -291,7 +291,7 @@ def main():
 Ornek kullanim:
   python main.py --bdf model.bdf --op2 model.op2 --h5 joint_loads.h5 --excel input.xlsx
   python main.py --bdf model.bdf --op2 model.op2 --h5 joint_loads.h5 --excel input.xlsx --output results.xlsx --subcase 1
-  python main.py --bdf model.bdf --op2 model.op2 --h5 joint_loads.h5 --excel input.xlsx --h5-group "Joint Load Cap/table"
+  python main.py --bdf model.bdf --op2 model.op2 --h5 joint_loads.h5 --excel input.xlsx --h5-group "JOINT_LOADS_CAP/table"
         """,
     )
 
@@ -325,7 +325,7 @@ Ornek kullanim:
     )
     parser.add_argument(
         "--h5-group", default=None,
-        help="H5 dosyasindaki Joint Load Cap tablosunun yolu (ornek: 'Joint Load Cap/table')",
+        help="H5 dosyasindaki Joint Load Cap tablosunun yolu (ornek: 'JOINT_LOADS_CAP/table')",
     )
     parser.add_argument(
         "-v", "--verbose", action="store_true",

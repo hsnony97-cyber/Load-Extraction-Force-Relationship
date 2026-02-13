@@ -1,9 +1,10 @@
 """
 H5 Reader Module
 
-Joint Load Extraction H5 dosyasından Joint Load Cap tablosunu okur.
-Ağaç yapısı: Joint Load Cap -> table
-Kolonlar: FBearingX, FBearingY, NX Bypass, NY Bypass, NXY Bypass
+Joint Load Extraction H5 dosyasından JOINT_LOADS_CAP tablosunu okur.
+Agac yapisi: JOINT_LOADS_CAP -> table
+Kolonlar: Bar Element ID, Subcase ID, F Bearing X, F Bearing Y,
+          NX Bypass, NY Bypass, NXY Bypass, Element Type
 """
 
 import logging
@@ -17,22 +18,30 @@ logger = logging.getLogger(__name__)
 
 
 class H5Reader:
-    """H5 dosyasından Joint Load Cap verilerini okur."""
+    """H5 dosyasından JOINT_LOADS_CAP verilerini okur."""
 
-    # Joint Load Cap tablosunda beklenen kolon isimleri
+    # JOINT_LOADS_CAP tablosunda beklenen kolon isimleri
     EXPECTED_COLUMNS = [
-        "FBearingX",
-        "FBearingY",
+        "F Bearing X",
+        "F Bearing Y",
         "NX Bypass",
         "NY Bypass",
         "NXY Bypass",
     ]
 
+    # Metadata kolonları
+    METADATA_COLUMNS = [
+        "Subcase ID",
+        "Element Type",
+    ]
+
     # Olası ID kolon isimleri
     ID_COLUMN_CANDIDATES = [
+        "Bar Element ID",
         "Bar EID",
         "BarEID",
         "Bar_EID",
+        "Bar_Element_ID",
         "EID",
         "Element_ID",
         "ElementID",

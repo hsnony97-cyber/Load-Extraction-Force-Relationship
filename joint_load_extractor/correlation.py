@@ -1,23 +1,23 @@
 """
 Correlation Engine Module
 
-Bar element axial force ve bağlı shell element fluxları (OP2) ile
-H5 Joint Load Cap değerleri (FBearingX, FBearingY, NX/NY/NXY Bypass)
-arasındaki korelasyonu hesaplar.
+Bar element axial force ve bagli shell element fluxlari (OP2) ile
+H5 JOINT_LOADS_CAP degerleri (F Bearing X, F Bearing Y, NX/NY/NXY Bypass)
+arasindaki korelasyonu hesaplar.
 
-Fiziksel İlişki (Bolted/Riveted Joint):
+Fiziksel Iliski (Bolted/Riveted Joint):
 =========================================
-Bir bağlantı noktasında (fastener = bar element):
-- Bearing Load: Bağlantı elemanı üzerinden panele aktarılan yük
-  FBearingX, FBearingY = Bar axial force'un X,Y bileşenleri
-- Bypass Load: Bağlantı elemanını atlayarak panelden geçen yük
+Bir baglanti noktasinda (fastener = bar element):
+- Bearing Load: Baglanti elemani uzerinden panele aktarilan yuk
+  F Bearing X, F Bearing Y = Bar axial force'un X,Y bileşenleri
+- Bypass Load: Baglanti elemanini atlayarak panelden gecen yuk
   N_Bypass = N_total - N_bearing
-  NX Bypass = Panel NX (total) - FBearingX katkısı
-  NY Bypass = Panel NY (total) - FBearingY katkısı
-  NXY Bypass = Panel NXY (total) - Bearing shear katkısı
+  NX Bypass = Panel NX (total) - F Bearing X katkisi
+  NY Bypass = Panel NY (total) - F Bearing Y katkisi
+  NXY Bypass = Panel NXY (total) - Bearing shear katkisi
 
-Her bar element ve element tipi (CQUAD4, CTRIA3) için ayrı ayrı
-korelasyon matrisi ve regresyon katsayıları hesaplanır.
+Her bar element ve element tipi (CQUAD4, CTRIA3) icin ayri ayri
+korelasyon matrisi ve regresyon katsayilari hesaplanir.
 """
 
 import logging
@@ -55,18 +55,18 @@ class CorrelationEngine:
     """
     OP2 kuvvetleri ile H5 Joint Load Cap arasında korelasyon hesaplar.
 
-    Her bar element için:
-    1. Bar axial force vs FBearingX, FBearingY
+    Her bar element icin:
+    1. Bar axial force vs F Bearing X, F Bearing Y
     2. Shell NX vs NX Bypass
     3. Shell NY vs NY Bypass
     4. Shell NXY vs NXY Bypass
 
-    Ayrıca çoklu regresyon analizi:
-    - FBearingX = a1*Axial + a2*Shear1 + a3*Shear2 + b
+    Ayrica coklu regresyon analizi:
+    - F Bearing X = a1*Axial + a2*Shear1 + a3*Shear2 + b
     - NX Bypass = a1*NX_shell + a2*Axial + b
     """
 
-    H5_TARGET_COLUMNS = ["FBearingX", "FBearingY", "NX Bypass", "NY Bypass", "NXY Bypass"]
+    H5_TARGET_COLUMNS = ["F Bearing X", "F Bearing Y", "NX Bypass", "NY Bypass", "NXY Bypass"]
 
     def __init__(self):
         self.results: List[CorrelationResult] = []
