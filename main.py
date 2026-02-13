@@ -9,6 +9,7 @@ aralarındaki korelasyonu hesaplar.
 
 Kullanım:
     python main.py --bdf model.bdf --op2 model.op2 --h5 joint_loads.h5 --excel input.xlsx --output output.xlsx
+    python main.py --bdf model.bdf --op2 file1.op2 file2.op2 file3.op2 --h5 joint_loads.h5 --excel input.xlsx
 
 Gerekli Input Dosyaları:
     - BDF: Nastran bulk data dosyası (element bağlantıları için)
@@ -288,6 +289,7 @@ def main():
         epilog="""
 Ornek kullanim:
   python main.py --bdf model.bdf --op2 model.op2 --h5 joint_loads.h5 --excel input.xlsx
+  python main.py --bdf model.bdf --op2 file1.op2 file2.op2 file3.op2 --h5 joint_loads.h5 --excel input.xlsx
   python main.py --bdf model.bdf --op2 model.op2 --h5 joint_loads.h5 --excel input.xlsx --output results.xlsx --subcase 1
   python main.py --bdf model.bdf --op2 model.op2 --h5 joint_loads.h5 --excel input.xlsx --h5-group "JOINT_LOADS_CAP/table"
         """,
@@ -302,8 +304,8 @@ Ornek kullanim:
         help="Nastran BDF dosyasi yolu",
     )
     parser.add_argument(
-        "--op2", required=False, default=None,
-        help="Nastran OP2 dosyasi yolu",
+        "--op2", required=False, default=None, nargs="+",
+        help="Nastran OP2 dosyasi yolu (birden fazla dosya verilebilir)",
     )
     parser.add_argument(
         "--h5", required=False, default=None,
@@ -359,7 +361,6 @@ Ornek kullanim:
     # Input dosya kontrolü
     for path_arg, name in [
         (args.bdf, "BDF"),
-        (args.op2, "OP2"),
         (args.h5, "H5"),
         (args.excel, "Excel"),
     ]:
@@ -368,6 +369,16 @@ Ornek kullanim:
             logger.error("%s dosyasi bulunamadi: %s", name, path_arg)
             sys.exit(1)
         logger.info("%s: %s", name, p.resolve())
+
+    # OP2 dosyalarini kontrol et
+    op2_paths = args.op2
+    for op2_path in op2_paths:
+        p = Path(op2_path)
+        if not p.exists():
+            logger.error("OP2 dosyasi bulunamadi: %s", op2_path)
+            sys.exit(1)
+        logger.info("OP2: %s", p.resolve())
+    logger.info("Toplam %d OP2 dosyasi", len(op2_paths))
 
     # ============================================================
     # ADIM 1: Excel'den bar element listesini oku
@@ -396,23 +407,18 @@ Ornek kullanim:
     logger.info("  Toplam %d bagli shell element", len(all_shell_eids))
 
     # ============================================================
-    # ADIM 3: OP2'den kuvvetleri oku
+    # ADIM 3: OP2'den kuvvetleri oku (toplu dosya destegi)
     # ============================================================
     logger.info("-" * 40)
-    logger.info("ADIM 3: OP2 okunuyor...")
-    op2_reader = OP2Reader(args.op2)
-    op2_reader.read()
+    logger.info("ADIM 3: OP2 okunuyor (%d dosya)...", len(op2_paths))
 
-    bar_forces = op2_reader.get_bar_forces(
+    bar_forces, shell_forces, op2_subcases = OP2Reader.read_multiple(
+        op2_paths=op2_paths,
         bar_eids=list(connectivity.keys()),
-        subcase_id=args.subcase,
-    )
-    logger.info("  %d bar element kuvvet verisi okundu", len(bar_forces))
-
-    shell_forces = op2_reader.get_shell_forces(
         shell_eids=list(all_shell_eids),
         subcase_id=args.subcase,
     )
+    logger.info("  %d bar element kuvvet verisi okundu", len(bar_forces))
     logger.info("  %d shell element flux verisi okundu", len(shell_forces))
 
     # ============================================================
@@ -471,6 +477,7 @@ Ornek kullanim:
     print(f"  Bar element sayisi:    {len(bar_element_ids)}")
     print(f"  Baglanti bulunan:      {len(connectivity)}")
     print(f"  Bagli shell element:   {len(all_shell_eids)}")
+    print(f"  OP2 dosya sayisi:      {len(op2_paths)}")
     print(f"  OP2 bar kuvvet:        {len(bar_forces)}")
     print(f"  OP2 shell flux:        {len(shell_forces)}")
     print(f"  H5 Joint Load satir:   {len(h5_reader.joint_load_cap)}")

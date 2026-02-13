@@ -549,6 +549,51 @@ class OP2Reader:
         return pd.DataFrame(rows)
 
     @staticmethod
+    def read_multiple(
+        op2_paths: List[str],
+        bar_eids: List[int],
+        shell_eids: List[int],
+        subcase_id: Optional[int] = None,
+    ) -> Tuple[
+        Dict[Tuple[int, int], "BarForceResult"],
+        Dict[Tuple[int, int], "ShellForceResult"],
+        List[int],
+    ]:
+        """
+        Birden fazla OP2 dosyasini oku ve sonuclari birlestir.
+
+        Returns
+        -------
+        bar_forces, shell_forces, all_subcases
+        """
+        logger = logging.getLogger(__name__)
+        merged_bar: Dict[Tuple[int, int], BarForceResult] = {}
+        merged_shell: Dict[Tuple[int, int], ShellForceResult] = {}
+        all_subcases: set = set()
+
+        for op2_path in op2_paths:
+            reader = OP2Reader(op2_path)
+            reader.read()
+            all_subcases.update(reader.subcases)
+
+            bar_f = reader.get_bar_forces(bar_eids, subcase_id)
+            for key, val in bar_f.items():
+                if key not in merged_bar:
+                    merged_bar[key] = val
+
+            shell_f = reader.get_shell_forces(shell_eids, subcase_id)
+            for key, val in shell_f.items():
+                if key not in merged_shell:
+                    merged_shell[key] = val
+
+        logger.info(
+            "Toplu OP2: %d dosya, %d subcase, %d bar, %d shell sonuc",
+            len(op2_paths), len(all_subcases),
+            len(merged_bar), len(merged_shell),
+        )
+        return merged_bar, merged_shell, sorted(all_subcases)
+
+    @staticmethod
     def _find_header_index(h_map: Dict[str, int], candidates: List[str]) -> Optional[int]:
         for c in candidates:
             c_lower = c.lower().strip()
@@ -1431,11 +1476,13 @@ class FileSelector(ttk.Frame):
         filetypes: list,
         is_save: bool = False,
         default_ext: str = "",
+        multiple: bool = False,
     ):
         super().__init__(parent)
         self.filetypes = filetypes
         self.is_save = is_save
         self.default_ext = default_ext
+        self.multiple = multiple
 
         self.columnconfigure(1, weight=1)
 
@@ -1455,13 +1502,26 @@ class FileSelector(ttk.Frame):
                 defaultextension=self.default_ext,
                 filetypes=self.filetypes,
             )
+            if path:
+                self.var.set(path)
+        elif self.multiple:
+            paths = filedialog.askopenfilenames(filetypes=self.filetypes)
+            if paths:
+                self.var.set("; ".join(paths))
         else:
             path = filedialog.askopenfilename(filetypes=self.filetypes)
-        if path:
-            self.var.set(path)
+            if path:
+                self.var.set(path)
 
     def get(self) -> str:
         return self.var.get().strip()
+
+    def get_multiple(self) -> List[str]:
+        """Birden fazla dosya yolu dondur (';' ile ayrilmis)."""
+        raw = self.var.get().strip()
+        if not raw:
+            return []
+        return [p.strip() for p in raw.split(";") if p.strip()]
 
     def set(self, value: str):
         self.var.set(value)
@@ -1516,6 +1576,7 @@ class Application(tk.Tk):
             file_frame,
             "OP2 Dosyasi:",
             [("Nastran OP2", "*.op2 *.OP2"), ("Tum Dosyalar", "*.*")],
+            multiple=True,
         )
         self.op2_selector.grid(row=1, column=0, sticky="ew", pady=2)
 
@@ -1639,22 +1700,35 @@ class Application(tk.Tk):
         ).pack(side="right")
 
     def _validate_inputs(self) -> bool:
-        checks = [
+        single_checks = [
             (self.bdf_selector.get(), "BDF dosyasi"),
-            (self.op2_selector.get(), "OP2 dosyasi"),
             (self.h5_selector.get(), "H5 dosyasi"),
             (self.excel_selector.get(), "Excel dosyasi"),
             (self.output_selector.get(), "Cikti dosyasi"),
         ]
 
-        for path, name in checks:
+        for path, name in single_checks:
             if not path:
                 messagebox.showwarning("Eksik Alan", f"{name} secilmedi!")
                 return False
 
-        for path, name in checks[:-1]:
+        # Tekli dosya kontrol (son eleman cikti, var olmasina gerek yok)
+        for path, name in single_checks[:-1]:
             if not Path(path).exists():
                 messagebox.showerror("Dosya Bulunamadi", f"{name} bulunamadi:\n{path}")
+                return False
+
+        # OP2 dosyalari (toplu secim destegi)
+        op2_paths = self.op2_selector.get_multiple()
+        if not op2_paths:
+            messagebox.showwarning("Eksik Alan", "OP2 dosyasi secilmedi!")
+            return False
+
+        for op2_path in op2_paths:
+            if not Path(op2_path).exists():
+                messagebox.showerror(
+                    "Dosya Bulunamadi", f"OP2 dosyasi bulunamadi:\n{op2_path}"
+                )
                 return False
 
         return True
@@ -1694,7 +1768,7 @@ class Application(tk.Tk):
 
         try:
             bdf_path = self.bdf_selector.get()
-            op2_path = self.op2_selector.get()
+            op2_paths = self.op2_selector.get_multiple()
             h5_path = self.h5_selector.get()
             excel_path = self.excel_selector.get()
             output_path = self.output_selector.get()
@@ -1724,20 +1798,18 @@ class Application(tk.Tk):
             logger.info("  %d bagli shell element", len(all_shell_eids))
 
             # ADIM 3
-            self._update_status("Adim 3/6: OP2 okunuyor...")
-            logger.info("ADIM 3: OP2 okunuyor...")
-            op2_reader = OP2Reader(op2_path)
-            op2_reader.read()
+            self._update_status("Adim 3/6: OP2 okunuyor (%d dosya)..." % len(op2_paths))
+            logger.info("ADIM 3: OP2 okunuyor (%d dosya)...", len(op2_paths))
 
-            bar_forces = op2_reader.get_bar_forces(
-                list(connectivity.keys()), subcase_id
-            )
-            shell_forces = op2_reader.get_shell_forces(
-                list(all_shell_eids), subcase_id
+            bar_forces, shell_forces, op2_subcases = OP2Reader.read_multiple(
+                op2_paths=op2_paths,
+                bar_eids=list(connectivity.keys()),
+                shell_eids=list(all_shell_eids),
+                subcase_id=subcase_id,
             )
             logger.info(
-                "  %d bar, %d shell kuvvet verisi",
-                len(bar_forces), len(shell_forces),
+                "  %d bar, %d shell kuvvet verisi (%d OP2 dosyasi)",
+                len(bar_forces), len(shell_forces), len(op2_paths),
             )
 
             # ADIM 4
@@ -1783,6 +1855,7 @@ class Application(tk.Tk):
                 lambda: messagebox.showinfo(
                     "Basarili",
                     f"Analiz tamamlandi!\n\n"
+                    f"OP2 dosya: {len(op2_paths)}\n"
                     f"Bar element: {len(bar_element_ids)}\n"
                     f"Baglanti: {len(connectivity)}\n"
                     f"Korelasyon: {len(correlation_results)}\n\n"
@@ -1862,7 +1935,6 @@ def run_cli(args: argparse.Namespace) -> None:
 
     for path_arg, name in [
         (args.bdf, "BDF"),
-        (args.op2, "OP2"),
         (args.h5, "H5"),
         (args.excel, "Excel"),
     ]:
@@ -1871,6 +1943,16 @@ def run_cli(args: argparse.Namespace) -> None:
             logger.error("%s dosyasi bulunamadi: %s", name, path_arg)
             sys.exit(1)
         logger.info("%s: %s", name, p.resolve())
+
+    # OP2 dosyalarini kontrol et
+    op2_paths = args.op2
+    for op2_path in op2_paths:
+        p = Path(op2_path)
+        if not p.exists():
+            logger.error("OP2 dosyasi bulunamadi: %s", op2_path)
+            sys.exit(1)
+        logger.info("OP2: %s", p.resolve())
+    logger.info("Toplam %d OP2 dosyasi", len(op2_paths))
 
     # ADIM 1
     logger.info("-" * 40)
@@ -1895,20 +1977,15 @@ def run_cli(args: argparse.Namespace) -> None:
 
     # ADIM 3
     logger.info("-" * 40)
-    logger.info("ADIM 3: OP2 okunuyor...")
-    op2_reader = OP2Reader(args.op2)
-    op2_reader.read()
+    logger.info("ADIM 3: OP2 okunuyor (%d dosya)...", len(op2_paths))
 
-    bar_forces = op2_reader.get_bar_forces(
+    bar_forces, shell_forces, op2_subcases = OP2Reader.read_multiple(
+        op2_paths=op2_paths,
         bar_eids=list(connectivity.keys()),
-        subcase_id=args.subcase,
-    )
-    logger.info("  %d bar element kuvvet verisi okundu", len(bar_forces))
-
-    shell_forces = op2_reader.get_shell_forces(
         shell_eids=list(all_shell_eids),
         subcase_id=args.subcase,
     )
+    logger.info("  %d bar element kuvvet verisi okundu", len(bar_forces))
     logger.info("  %d shell element flux verisi okundu", len(shell_forces))
 
     # ADIM 4
@@ -1960,6 +2037,7 @@ def run_cli(args: argparse.Namespace) -> None:
     print(f"  Bar element sayisi:    {len(bar_element_ids)}")
     print(f"  Baglanti bulunan:      {len(connectivity)}")
     print(f"  Bagli shell element:   {len(all_shell_eids)}")
+    print(f"  OP2 dosya sayisi:      {len(op2_paths)}")
     print(f"  OP2 bar kuvvet:        {len(bar_forces)}")
     print(f"  OP2 shell flux:        {len(shell_forces)}")
     print(f"  H5 Joint Load satir:   {len(h5_reader.joint_load_cap)}")
@@ -1981,6 +2059,7 @@ def main():
 Kullanim modlari:
   python app_standalone.py                  # GUI baslatir (varsayilan)
   python app_standalone.py --cli --bdf model.bdf --op2 model.op2 --h5 joint_loads.h5 --excel input.xlsx
+  python app_standalone.py --cli --bdf model.bdf --op2 file1.op2 file2.op2 file3.op2 --h5 joint_loads.h5 --excel input.xlsx
   python app_standalone.py --cli --bdf model.bdf --op2 model.op2 --h5 joint_loads.h5 --excel input.xlsx --output results.xlsx --subcase 1
         """,
     )
@@ -1991,7 +2070,7 @@ Kullanim modlari:
         help="Komut satiri modunda calistir (GUI yerine)",
     )
     parser.add_argument("--bdf", default=None, help="Nastran BDF dosyasi yolu")
-    parser.add_argument("--op2", default=None, help="Nastran OP2 dosyasi yolu")
+    parser.add_argument("--op2", default=None, nargs="+", help="Nastran OP2 dosyasi yolu (birden fazla dosya verilebilir)")
     parser.add_argument("--h5", default=None, help="Joint Load Extraction H5 dosyasi yolu")
     parser.add_argument("--excel", default=None, help="Bar Element Set iceren Excel dosyasi yolu")
     parser.add_argument(

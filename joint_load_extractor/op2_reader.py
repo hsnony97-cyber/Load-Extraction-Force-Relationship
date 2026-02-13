@@ -63,6 +63,55 @@ class OP2Reader:
         self._available_subcases = self._collect_subcase_ids()
         logger.info("OP2 okundu. Subcases: %s", self._available_subcases)
 
+    @staticmethod
+    def read_multiple(
+        op2_paths: List[str],
+        bar_eids: List[int],
+        shell_eids: List[int],
+        subcase_id: Optional[int] = None,
+    ) -> Tuple[
+        Dict[Tuple[int, int], "BarForceResult"],
+        Dict[Tuple[int, int], "ShellForceResult"],
+        List[int],
+    ]:
+        """
+        Birden fazla OP2 dosyasini oku ve sonuclari birlestir.
+
+        Returns
+        -------
+        bar_forces : Dict
+            Birlestirilmis bar kuvvet sonuclari.
+        shell_forces : Dict
+            Birlestirilmis shell flux sonuclari.
+        all_subcases : List[int]
+            Tum OP2'lerdeki subcase ID'leri.
+        """
+        merged_bar: Dict[Tuple[int, int], BarForceResult] = {}
+        merged_shell: Dict[Tuple[int, int], ShellForceResult] = {}
+        all_subcases: set = set()
+
+        for op2_path in op2_paths:
+            reader = OP2Reader(op2_path)
+            reader.read()
+            all_subcases.update(reader.subcases)
+
+            bar_f = reader.get_bar_forces(bar_eids, subcase_id)
+            for key, val in bar_f.items():
+                if key not in merged_bar:
+                    merged_bar[key] = val
+
+            shell_f = reader.get_shell_forces(shell_eids, subcase_id)
+            for key, val in shell_f.items():
+                if key not in merged_shell:
+                    merged_shell[key] = val
+
+        logger.info(
+            "Toplu OP2: %d dosya, %d subcase, %d bar, %d shell sonuc",
+            len(op2_paths), len(all_subcases),
+            len(merged_bar), len(merged_shell),
+        )
+        return merged_bar, merged_shell, sorted(all_subcases)
+
     @property
     def subcases(self) -> List[int]:
         return self._available_subcases
