@@ -1416,11 +1416,24 @@ def run_correlation_analysis(
         logger.info("  Bar %d: %d subcase, %d shell uzerinden veri toplandi",
                      bar_eid, len(collected_sc_ids), n_shells)
 
+        # OP2 verilerini subcase_id'ye gore dict'e koy (eslestirme icin)
+        op2_by_sc = {}
+        for i, sc_id in enumerate(collected_sc_ids):
+            op2_by_sc[sc_id] = (
+                collected_axial[i],
+                collected_avg_nx[i],
+                collected_avg_ny[i],
+                collected_avg_nxy[i],
+            )
+
         et_col = _find_element_type_col(h5_data)
         if et_col is not None:
             element_types = sorted(h5_data[et_col].unique())
         else:
             element_types = [0]
+
+        # H5'teki Subcase ID kolonunu bul
+        sc_col = _find_subcase_col(h5_data)
 
         for et in element_types:
             if et_col is not None:
@@ -1431,18 +1444,73 @@ def run_correlation_analysis(
             if h5_subset.empty:
                 continue
 
-            logger.info("  Bar %d, ElementType %s, %d H5 satir, %d OP2 subcase",
-                        bar_eid, et, len(h5_subset), len(collected_sc_ids))
+            # --- Subcase ID eslestirmesi ---
+            if sc_col is not None:
+                matched_axial = []
+                matched_nx = []
+                matched_ny = []
+                matched_nxy = []
+                matched_h5_indices = []
+
+                for idx, row in h5_subset.iterrows():
+                    h5_sc = int(row[sc_col])
+                    if h5_sc in op2_by_sc:
+                        ax, nx, ny, nxy = op2_by_sc[h5_sc]
+                        matched_axial.append(ax)
+                        matched_nx.append(nx)
+                        matched_ny.append(ny)
+                        matched_nxy.append(nxy)
+                        matched_h5_indices.append(idx)
+
+                n_matched = len(matched_h5_indices)
+                n_h5_total = len(h5_subset)
+                n_op2_total = len(collected_sc_ids)
+
+                logger.info(
+                    "  Bar %d, ET %s: %d/%d H5 satir OP2 ile eslesti "
+                    "(H5: %d satir, OP2: %d subcase)",
+                    bar_eid, et, n_matched, n_h5_total, n_h5_total, n_op2_total,
+                )
+
+                if not matched_h5_indices:
+                    logger.warning(
+                        "  Bar %d, ET %s: Hicbir subcase eslesmiyor! "
+                        "OP2 SC: %s, H5 SC: %s",
+                        bar_eid, et,
+                        sorted(op2_by_sc.keys()),
+                        sorted(h5_subset[sc_col].unique().tolist()),
+                    )
+                    continue
+
+                h5_matched = h5_subset.loc[matched_h5_indices].reset_index(drop=True)
+                pred_axial = np.array(matched_axial)
+                pred_nx = np.array(matched_nx)
+                pred_ny = np.array(matched_ny)
+                pred_nxy = np.array(matched_nxy)
+            else:
+                logger.warning(
+                    "  Bar %d: H5'te Subcase ID kolonu bulunamadi, "
+                    "sirali eslestirme yapiliyor",
+                    bar_eid,
+                )
+                h5_matched = h5_subset
+                pred_axial = np.array(collected_axial)
+                pred_nx = np.array(collected_avg_nx)
+                pred_ny = np.array(collected_avg_ny)
+                pred_nxy = np.array(collected_avg_nxy)
+
+            logger.info("  Bar %d, ElementType %s, %d eslesen veri noktasi",
+                        bar_eid, et, len(pred_axial))
 
             result = engine.compute_joint_correlation(
                 bar_eid=bar_eid,
                 subcase_id=0,
                 element_type=int(et),
-                bar_axial=np.array(collected_axial),
-                avg_shell_nx=np.array(collected_avg_nx),
-                avg_shell_ny=np.array(collected_avg_ny),
-                avg_shell_nxy=np.array(collected_avg_nxy),
-                h5_data=h5_subset,
+                bar_axial=pred_axial,
+                avg_shell_nx=pred_nx,
+                avg_shell_ny=pred_ny,
+                avg_shell_nxy=pred_nxy,
+                h5_data=h5_matched,
                 n_shells=n_shells,
             )
             all_results.append(result)
