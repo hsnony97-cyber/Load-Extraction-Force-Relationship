@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 
 from joint_load_extractor.bdf_parser import BarElementInfo
-from joint_load_extractor.correlation import CorrelationResult
+from joint_load_extractor.correlation import JointCorrelationResult
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +48,7 @@ class ReportGenerator:
         bar_forces_df: pd.DataFrame,
         shell_forces_df: pd.DataFrame,
         h5_joint_loads: pd.DataFrame,
-        correlation_results: List[CorrelationResult],
+        correlation_results: List[JointCorrelationResult],
         correlation_summary_df: pd.DataFrame,
     ) -> str:
         """
@@ -234,29 +234,31 @@ class ReportGenerator:
         self, writer, workbook, connectivity, correlation_results,
         header_fmt, number_fmt, int_fmt, bar_fmt, quad_fmt, tria_fmt, border_fmt,
     ):
-        """Her bar element için detay sheet'i."""
-        # Korelasyon sonuçlarını bar_eid'ye göre grupla
+        """Her bar element icin detay sheet'i - regresyon denklemleri."""
+        # Korelasyon sonuclarini bar_eid'ye gore grupla
         bar_results = {}
         for res in correlation_results:
             if res.bar_eid not in bar_results:
                 bar_results[res.bar_eid] = []
             bar_results[res.bar_eid].append(res)
 
+        good_r2_fmt = workbook.add_format({
+            "num_format": "0.0000", "border": 1, "bg_color": self.CORR_POS_COLOR,
+        })
+        eq_fmt = workbook.add_format({"border": 1, "text_wrap": True, "font_size": 9})
+
         for bar_eid, results in sorted(bar_results.items()):
             sheet_name = f"Bar_{bar_eid}"[:31]
             ws = workbook.add_worksheet(sheet_name)
-
             row = 0
 
-            # --- Başlık ---
-            title_fmt = workbook.add_format({
-                "bold": True, "font_size": 14, "bottom": 2,
-            })
-            ws.write(row, 0, f"Bar Element {bar_eid} - Detail", title_fmt)
+            title_fmt = workbook.add_format({"bold": True, "font_size": 14, "bottom": 2})
+            ws.write(row, 0, f"Bar Element {bar_eid} - Regression", title_fmt)
             row += 2
 
-            # --- Bağlantı Bilgisi ---
+            # --- Baglanti Bilgisi ---
             ws.write(row, 0, "Element Connectivity", header_fmt)
+            ws.merge_range(row, 0, row, 1, "Element Connectivity", header_fmt)
             row += 1
             info = connectivity.get(bar_eid)
             if info:
@@ -276,65 +278,50 @@ class ReportGenerator:
                 ws.write(row, 1, ", ".join(str(e) for e in info.connected_trias.keys()), border_fmt)
                 row += 2
 
-            # --- Korelasyon Matrisleri (element tipine göre ayrı) ---
+            # --- Regresyon Denklemleri ---
             for res in results:
-                ws.write(row, 0, f"Correlation: {res.element_type}", header_fmt)
-                ws.merge_range(row, 0, row, 5, f"Correlation: {res.element_type}", header_fmt)
+                ws.write(row, 0, f"Subcase {res.subcase_id} | {res.n_connected_shells} shell", header_fmt)
+                ws.merge_range(
+                    row, 0, row, 6,
+                    f"Multiple Regression (SC {res.subcase_id}, {res.n_connected_shells} shells)",
+                    header_fmt,
+                )
                 row += 1
 
-                if res.correlation_matrix is not None and not res.correlation_matrix.empty:
-                    corr = res.correlation_matrix
+                if not res.equations:
+                    ws.write(row, 0, "Denklem hesaplanamadi", border_fmt)
+                    row += 2
+                    continue
 
-                    # Kolon başlıkları
-                    ws.write(row, 0, "OP2 \\ H5", header_fmt)
-                    for j, h5_col in enumerate(corr.columns):
-                        ws.write(row, j + 1, h5_col, header_fmt)
+                # Tablo basliklari
+                eq_headers = [
+                    "Target", "Coeff Bar_Axial", "Coeff Avg_Nx",
+                    "Coeff Avg_Ny", "Coeff Avg_Nxy", "Intercept", "R²",
+                ]
+                for j, h in enumerate(eq_headers):
+                    ws.write(row, j, h, header_fmt)
+                row += 1
+
+                for eq in res.equations:
+                    ws.write(row, 0, eq.target_name, border_fmt)
+                    for ci, coeff in enumerate(eq.coefficients):
+                        ws.write(row, ci + 1, float(coeff), number_fmt)
+                    ws.write(row, 5, float(eq.intercept), number_fmt)
+                    r2_fmt = good_r2_fmt if eq.r_squared >= 0.7 else number_fmt
+                    ws.write(row, 6, eq.r_squared, r2_fmt)
                     row += 1
 
-                    # Satırlar
-                    for i, op2_col in enumerate(corr.index):
-                        ws.write(row, 0, op2_col, border_fmt)
-                        for j, h5_col in enumerate(corr.columns):
-                            val = corr.iloc[i, j]
-                            if np.isnan(val):
-                                ws.write(row, j + 1, "N/A", border_fmt)
-                            else:
-                                # Renk kodlaması
-                                if abs(val) >= 0.7:
-                                    cell_fmt = workbook.add_format({
-                                        "num_format": "0.0000",
-                                        "border": 1,
-                                        "bg_color": self.CORR_POS_COLOR if val > 0 else self.CORR_NEG_COLOR,
-                                    })
-                                else:
-                                    cell_fmt = number_fmt
-                                ws.write(row, j + 1, val, cell_fmt)
-                        row += 1
-                    row += 1
+                row += 1
 
-                # Regresyon sonuçları
-                if res.regression_results:
-                    ws.write(row, 0, "Regression Results", header_fmt)
-                    ws.merge_range(row, 0, row, 6, f"Regression: {res.element_type}", header_fmt)
+                # Denklem string olarak
+                ws.write(row, 0, "Equations", header_fmt)
+                ws.merge_range(row, 0, row, 6, "Equations", header_fmt)
+                row += 1
+                for eq in res.equations:
+                    ws.merge_range(row, 0, row, 6, eq.equation_str(), eq_fmt)
                     row += 1
+                row += 1
 
-                    reg_headers = ["H5 Target", "OP2 Predictor", "Slope", "Intercept", "R²", "P-Value", "Std Error"]
-                    for j, h in enumerate(reg_headers):
-                        ws.write(row, j, h, header_fmt)
-                    row += 1
-
-                    for h5_col, op2_dict in res.regression_results.items():
-                        for op2_col, (slope, intercept, r_val, p_val, std_err) in op2_dict.items():
-                            ws.write(row, 0, h5_col, border_fmt)
-                            ws.write(row, 1, op2_col, border_fmt)
-                            ws.write(row, 2, slope, number_fmt)
-                            ws.write(row, 3, intercept, number_fmt)
-                            ws.write(row, 4, r_val ** 2, number_fmt)
-                            ws.write(row, 5, p_val, number_fmt)
-                            ws.write(row, 6, std_err, number_fmt)
-                            row += 1
-                    row += 1
-
-            # Kolon genişlikleri
-            ws.set_column(0, 0, 20)
-            ws.set_column(1, 6, 16)
+            ws.set_column(0, 0, 18)
+            ws.set_column(1, 5, 16)
+            ws.set_column(6, 6, 12)

@@ -3,21 +3,23 @@ Correlation Engine Module
 
 Bar element axial force ve bagli shell element fluxlari (OP2) ile
 H5 JOINT_LOADS_CAP degerleri (F Bearing X, F Bearing Y, NX/NY/NXY Bypass)
-arasindaki korelasyonu hesaplar.
+arasinda coklu regresyon denklemi olusturur.
 
-Fiziksel Iliski (Bolted/Riveted Joint):
-=========================================
-Bir baglanti noktasinda (fastener = bar element):
-- Bearing Load: Baglanti elemani uzerinden panele aktarilan yuk
-  F Bearing X, F Bearing Y = Bar axial force'un X,Y bileşenleri
-- Bypass Load: Baglanti elemanini atlayarak panelden gecen yuk
-  N_Bypass = N_total - N_bearing
-  NX Bypass = Panel NX (total) - F Bearing X katkisi
-  NY Bypass = Panel NY (total) - F Bearing Y katkisi
-  NXY Bypass = Panel NXY (total) - Bearing shear katkisi
+Her bar element icin 4 predictor (bagımsız degisken):
+  - Bar Axial Force (OP2)
+  - Avg Shell Nx (bagli tum shell'lerin ortalamasi, OP2)
+  - Avg Shell Ny (bagli tum shell'lerin ortalamasi, OP2)
+  - Avg Shell Nxy (bagli tum shell'lerin ortalamasi, OP2)
 
-Her bar element ve element tipi (CQUAD4, CTRIA3) icin ayri ayri
-korelasyon matrisi ve regresyon katsayilari hesaplanir.
+5 hedef (bagimli degisken, H5'ten):
+  - F Bearing X
+  - F Bearing Y
+  - NX Bypass
+  - NY Bypass
+  - NXY Bypass
+
+Denklem:
+  Target = a1*Bar_Axial + a2*Avg_Nx + a3*Avg_Ny + a4*Avg_Nxy + b
 """
 
 import logging
@@ -26,63 +28,68 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from scipy import stats
 
 logger = logging.getLogger(__name__)
 
 
+PREDICTOR_NAMES = ["Bar_Axial", "Avg_Shell_Nx", "Avg_Shell_Ny", "Avg_Shell_Nxy"]
+H5_TARGET_COLUMNS = ["F Bearing X", "F Bearing Y", "NX Bypass", "NY Bypass", "NXY Bypass"]
+
+
 @dataclass
-class CorrelationResult:
-    """Bir bar element için korelasyon sonuçları."""
+class RegressionEquation:
+    """Tek bir hedef icin coklu regresyon denklemi."""
+    target_name: str
+    predictor_names: List[str]
+    coefficients: np.ndarray   # [a1, a2, a3, a4]
+    intercept: float
+    r_squared: float
+    n_samples: int
+
+    def equation_str(self) -> str:
+        """Denklemi okunabilir string olarak dondur."""
+        parts = []
+        for name, coeff in zip(self.predictor_names, self.coefficients):
+            parts.append(f"{coeff:+.6f}*{name}")
+        return f"{self.target_name} = {' '.join(parts)} {self.intercept:+.6f}"
+
+
+@dataclass
+class JointCorrelationResult:
+    """Bir bar element icin tum korelasyon sonuclari."""
     bar_eid: int
     subcase_id: int
-    element_type: str  # "BAR", "CQUAD4", "CTRIA3" vb.
-
-    # OP2'den gelen değerler
-    op2_values: Dict[str, np.ndarray] = field(default_factory=dict)
-
-    # H5'ten gelen Joint Load Cap değerleri
-    h5_values: Dict[str, np.ndarray] = field(default_factory=dict)
-
-    # Korelasyon matrisi (Pearson r)
-    correlation_matrix: Optional[pd.DataFrame] = None
-
-    # Regresyon katsayıları: h5_col -> {op2_col: (slope, intercept, r_value, p_value, std_err)}
-    regression_results: Dict[str, Dict[str, Tuple]] = field(default_factory=dict)
+    n_connected_shells: int
+    equations: List[RegressionEquation] = field(default_factory=list)
+    predictor_data: Dict[str, np.ndarray] = field(default_factory=dict)
+    target_data: Dict[str, np.ndarray] = field(default_factory=dict)
 
 
 class CorrelationEngine:
     """
-    OP2 kuvvetleri ile H5 Joint Load Cap arasında korelasyon hesaplar.
+    OP2 kuvvetleri ile H5 Joint Load Cap arasinda coklu regresyon hesaplar.
 
     Her bar element icin:
-    1. Bar axial force vs F Bearing X, F Bearing Y
-    2. Shell NX vs NX Bypass
-    3. Shell NY vs NY Bypass
-    4. Shell NXY vs NXY Bypass
-
-    Ayrica coklu regresyon analizi:
-    - F Bearing X = a1*Axial + a2*Shear1 + a3*Shear2 + b
-    - NX Bypass = a1*NX_shell + a2*Axial + b
+      Target = a1*Bar_Axial + a2*Avg_Nx + a3*Avg_Ny + a4*Avg_Nxy + b
     """
 
-    H5_TARGET_COLUMNS = ["F Bearing X", "F Bearing Y", "NX Bypass", "NY Bypass", "NXY Bypass"]
-
     def __init__(self):
-        self.results: List[CorrelationResult] = []
+        self.results: List[JointCorrelationResult] = []
 
-    def compute_bar_correlation(
+    def compute_joint_correlation(
         self,
         bar_eid: int,
         subcase_id: int,
         bar_axial: np.ndarray,
-        bar_shear1: np.ndarray,
-        bar_shear2: np.ndarray,
-        bar_torque: np.ndarray,
+        avg_shell_nx: np.ndarray,
+        avg_shell_ny: np.ndarray,
+        avg_shell_nxy: np.ndarray,
         h5_data: pd.DataFrame,
-    ) -> CorrelationResult:
+        n_shells: int,
+    ) -> JointCorrelationResult:
         """
-        Bar element kuvvetleri ile H5 Joint Load Cap arasında korelasyon.
+        Bar + ortalama shell kuvvetleri ile H5 hedefleri arasinda
+        coklu regresyon denklemi olusturur.
 
         Parameters
         ----------
@@ -91,322 +98,128 @@ class CorrelationEngine:
         subcase_id : int
             Subcase ID.
         bar_axial : np.ndarray
-            Bar axial force dizisi.
-        bar_shear1, bar_shear2 : np.ndarray
-            Bar shear force dizileri.
-        bar_torque : np.ndarray
-            Bar torque dizisi.
-        h5_data : pd.DataFrame
-            H5 Joint Load Cap verileri (bu bar element için).
-
-        Returns
-        -------
-        CorrelationResult
-        """
-        result = CorrelationResult(
-            bar_eid=bar_eid,
-            subcase_id=subcase_id,
-            element_type="BAR",
-        )
-
-        # OP2 değerleri
-        result.op2_values = {
-            "Axial_Force": bar_axial,
-            "Shear_1": bar_shear1,
-            "Shear_2": bar_shear2,
-            "Torque": bar_torque,
-        }
-
-        # H5 değerleri
-        for col in self.H5_TARGET_COLUMNS:
-            matching_cols = [c for c in h5_data.columns if self._normalize(c) == self._normalize(col)]
-            if matching_cols:
-                result.h5_values[col] = h5_data[matching_cols[0]].values
-
-        # Korelasyon hesapla
-        result.correlation_matrix = self._compute_correlation_matrix(
-            result.op2_values, result.h5_values
-        )
-
-        # Regresyon hesapla
-        result.regression_results = self._compute_regressions(
-            result.op2_values, result.h5_values
-        )
-
-        self.results.append(result)
-        return result
-
-    def compute_shell_correlation(
-        self,
-        bar_eid: int,
-        subcase_id: int,
-        shell_eid: int,
-        elem_type: str,
-        nx: np.ndarray,
-        ny: np.ndarray,
-        nxy: np.ndarray,
-        h5_data: pd.DataFrame,
-    ) -> CorrelationResult:
-        """
-        Shell element fluxları ile H5 Joint Load Cap arasında korelasyon.
-
-        Parameters
-        ----------
-        bar_eid : int
-            İlişkili bar element ID.
-        subcase_id : int
-            Subcase ID.
-        shell_eid : int
-            Shell element ID.
-        elem_type : str
-            Element tipi (CQUAD4, CTRIA3, vb.).
-        nx, ny, nxy : np.ndarray
-            Shell membrane fluxları.
+            Bar axial force (ntimes,).
+        avg_shell_nx, avg_shell_ny, avg_shell_nxy : np.ndarray
+            Bagli tum shell'lerin ortalama Nx, Ny, Nxy (ntimes,).
         h5_data : pd.DataFrame
             H5 Joint Load Cap verileri.
-
-        Returns
-        -------
-        CorrelationResult
+        n_shells : int
+            Bagli shell sayisi.
         """
-        result = CorrelationResult(
+        result = JointCorrelationResult(
             bar_eid=bar_eid,
             subcase_id=subcase_id,
-            element_type=f"{elem_type}_{shell_eid}",
+            n_connected_shells=n_shells,
         )
 
-        result.op2_values = {
-            "NX_Flux": nx,
-            "NY_Flux": ny,
-            "NXY_Flux": nxy,
+        # Predictor verileri
+        predictors = {
+            "Bar_Axial": np.asarray(bar_axial, dtype=float),
+            "Avg_Shell_Nx": np.asarray(avg_shell_nx, dtype=float),
+            "Avg_Shell_Ny": np.asarray(avg_shell_ny, dtype=float),
+            "Avg_Shell_Nxy": np.asarray(avg_shell_nxy, dtype=float),
         }
+        result.predictor_data = predictors
 
-        for col in self.H5_TARGET_COLUMNS:
-            matching_cols = [c for c in h5_data.columns if self._normalize(c) == self._normalize(col)]
-            if matching_cols:
-                result.h5_values[col] = h5_data[matching_cols[0]].values
+        # H5 hedef verileri
+        targets = {}
+        for col in H5_TARGET_COLUMNS:
+            matching = [c for c in h5_data.columns
+                        if self._normalize(c) == self._normalize(col)]
+            if matching:
+                targets[col] = h5_data[matching[0]].values.astype(float)
+        result.target_data = targets
 
-        result.correlation_matrix = self._compute_correlation_matrix(
-            result.op2_values, result.h5_values
-        )
-        result.regression_results = self._compute_regressions(
-            result.op2_values, result.h5_values
-        )
+        if not targets:
+            logger.warning("Bar %d: H5 hedef kolonlari bulunamadi", bar_eid)
+            self.results.append(result)
+            return result
 
-        self.results.append(result)
-        return result
+        # Veri uzunluklarini esitle
+        all_arrays = list(predictors.values()) + list(targets.values())
+        min_len = min(len(a) for a in all_arrays)
+        if min_len < 5:
+            logger.warning(
+                "Bar %d: Yetersiz veri noktasi (%d), regresyon atlanıyor",
+                bar_eid, min_len,
+            )
+            self.results.append(result)
+            return result
 
-    def compute_combined_correlation(
-        self,
-        bar_eid: int,
-        subcase_id: int,
-        bar_axial: np.ndarray,
-        bar_shear1: np.ndarray,
-        bar_shear2: np.ndarray,
-        shell_forces: Dict[int, Dict[str, np.ndarray]],
-        h5_data: pd.DataFrame,
-        shell_types: Dict[int, str],
-    ) -> CorrelationResult:
-        """
-        Bar + Shell kuvvetlerini birleştirip H5 ile korelasyon.
+        # Predictor matrisi: (n, 4)
+        X_raw = np.column_stack([v[:min_len] for v in predictors.values()])
 
-        Ortalama shell fluxlarını bar kuvvetleri ile birlikte kullanır.
+        # Her hedef icin coklu regresyon
+        for target_name, target_arr in targets.items():
+            y = target_arr[:min_len]
 
-        Parameters
-        ----------
-        bar_eid : int
-            Bar element ID.
-        subcase_id : int
-            Subcase ID.
-        bar_axial : np.ndarray
-            Bar axial force.
-        bar_shear1, bar_shear2 : np.ndarray
-            Bar shear forces.
-        shell_forces : Dict[int, Dict[str, np.ndarray]]
-            Shell element ID -> {NX, NY, NXY} fluxları.
-        h5_data : pd.DataFrame
-            H5 Joint Load Cap verileri.
-        shell_types : Dict[int, str]
-            Shell element ID -> element tipi.
-        """
-        result = CorrelationResult(
-            bar_eid=bar_eid,
-            subcase_id=subcase_id,
-            element_type="COMBINED",
-        )
+            # NaN satirlarini kaldir
+            valid = np.all(np.isfinite(X_raw), axis=1) & np.isfinite(y)
+            n_valid = int(valid.sum())
+            if n_valid < 5:
+                logger.debug(
+                    "Bar %d, %s: Yetersiz gecerli veri (%d)",
+                    bar_eid, target_name, n_valid,
+                )
+                continue
 
-        # Bar kuvvetleri
-        result.op2_values["Bar_Axial"] = bar_axial
-        result.op2_values["Bar_Shear1"] = bar_shear1
-        result.op2_values["Bar_Shear2"] = bar_shear2
+            X = X_raw[valid]
+            y_valid = y[valid]
 
-        # Shell fluxlarının ortalaması (QUAD ve TRIA ayrı)
-        quad_nx, quad_ny, quad_nxy = [], [], []
-        tria_nx, tria_ny, tria_nxy = [], [], []
+            # Intercept kolonu ekle: (n, 5)
+            X_aug = np.column_stack([X, np.ones(X.shape[0])])
 
-        for seid, forces in shell_forces.items():
-            stype = shell_types.get(seid, "UNKNOWN")
-            if "QUAD" in stype:
-                quad_nx.append(forces.get("NX", np.zeros_like(bar_axial)))
-                quad_ny.append(forces.get("NY", np.zeros_like(bar_axial)))
-                quad_nxy.append(forces.get("NXY", np.zeros_like(bar_axial)))
-            elif "TRI" in stype:
-                tria_nx.append(forces.get("NX", np.zeros_like(bar_axial)))
-                tria_ny.append(forces.get("NY", np.zeros_like(bar_axial)))
-                tria_nxy.append(forces.get("NXY", np.zeros_like(bar_axial)))
+            try:
+                coeffs, _, _, _ = np.linalg.lstsq(X_aug, y_valid, rcond=None)
+            except np.linalg.LinAlgError as e:
+                logger.warning("Bar %d, %s: lstsq hatasi: %s", bar_eid, target_name, e)
+                continue
 
-        if quad_nx:
-            result.op2_values["Avg_QUAD_NX"] = np.mean(quad_nx, axis=0)
-            result.op2_values["Avg_QUAD_NY"] = np.mean(quad_ny, axis=0)
-            result.op2_values["Avg_QUAD_NXY"] = np.mean(quad_nxy, axis=0)
+            # R² hesapla
+            y_pred = X_aug @ coeffs
+            ss_res = np.sum((y_valid - y_pred) ** 2)
+            ss_tot = np.sum((y_valid - np.mean(y_valid)) ** 2)
+            r_squared = 1.0 - ss_res / ss_tot if ss_tot > 1e-15 else 0.0
 
-        if tria_nx:
-            result.op2_values["Avg_TRIA_NX"] = np.mean(tria_nx, axis=0)
-            result.op2_values["Avg_TRIA_NY"] = np.mean(tria_ny, axis=0)
-            result.op2_values["Avg_TRIA_NXY"] = np.mean(tria_nxy, axis=0)
+            eq = RegressionEquation(
+                target_name=target_name,
+                predictor_names=list(predictors.keys()),
+                coefficients=coeffs[:-1],
+                intercept=coeffs[-1],
+                r_squared=max(0.0, r_squared),
+                n_samples=n_valid,
+            )
+            result.equations.append(eq)
 
-        for col in self.H5_TARGET_COLUMNS:
-            matching_cols = [c for c in h5_data.columns if self._normalize(c) == self._normalize(col)]
-            if matching_cols:
-                result.h5_values[col] = h5_data[matching_cols[0]].values
-
-        result.correlation_matrix = self._compute_correlation_matrix(
-            result.op2_values, result.h5_values
-        )
-        result.regression_results = self._compute_regressions(
-            result.op2_values, result.h5_values
-        )
+            logger.info(
+                "Bar %d | %s | R²=%.4f | n=%d",
+                bar_eid, eq.equation_str(), r_squared, n_valid,
+            )
 
         self.results.append(result)
         return result
 
     def get_summary_dataframe(self) -> pd.DataFrame:
-        """Tüm korelasyon sonuçlarını özet DataFrame olarak döndür."""
+        """Tum korelasyon denklemlerini ozet DataFrame olarak dondur."""
         rows = []
         for res in self.results:
-            if res.correlation_matrix is None:
-                continue
-
-            for h5_col in res.correlation_matrix.columns:
-                for op2_col in res.correlation_matrix.index:
-                    r_val = res.correlation_matrix.loc[op2_col, h5_col]
-                    reg = res.regression_results.get(h5_col, {}).get(op2_col)
-
-                    row = {
-                        "Bar_EID": res.bar_eid,
-                        "Subcase_ID": res.subcase_id,
-                        "Element_Type": res.element_type,
-                        "OP2_Parameter": op2_col,
-                        "H5_Parameter": h5_col,
-                        "Pearson_R": r_val,
-                        "R_Squared": r_val ** 2 if not np.isnan(r_val) else np.nan,
-                    }
-
-                    if reg is not None:
-                        row["Slope"] = reg[0]
-                        row["Intercept"] = reg[1]
-                        row["P_Value"] = reg[3]
-                        row["Std_Error"] = reg[4]
-
-                    rows.append(row)
-
+            for eq in res.equations:
+                row = {
+                    "Bar_EID": res.bar_eid,
+                    "Subcase_ID": res.subcase_id,
+                    "N_Shells": res.n_connected_shells,
+                    "Target": eq.target_name,
+                    "R_Squared": eq.r_squared,
+                    "N_Samples": eq.n_samples,
+                    "Intercept": eq.intercept,
+                }
+                for pname, coeff in zip(eq.predictor_names, eq.coefficients):
+                    row[f"Coeff_{pname}"] = coeff
+                row["Equation"] = eq.equation_str()
+                rows.append(row)
         return pd.DataFrame(rows)
 
     @staticmethod
-    def _compute_correlation_matrix(
-        op2_values: Dict[str, np.ndarray],
-        h5_values: Dict[str, np.ndarray],
-    ) -> Optional[pd.DataFrame]:
-        """Pearson korelasyon matrisini hesapla."""
-        if not op2_values or not h5_values:
-            return None
-
-        # Veri uzunluklarını kontrol et
-        lengths = set()
-        for v in list(op2_values.values()) + list(h5_values.values()):
-            lengths.add(len(v))
-
-        if len(lengths) > 1:
-            # Uzunluklar farklıysa en kısa uzunluğa kes
-            min_len = min(lengths)
-            logger.warning(
-                "Farkli veri uzunluklari: %s. %d'ye kesiliyor.",
-                lengths, min_len,
-            )
-            op2_trimmed = {k: v[:min_len] for k, v in op2_values.items()}
-            h5_trimmed = {k: v[:min_len] for k, v in h5_values.items()}
-        else:
-            op2_trimmed = op2_values
-            h5_trimmed = h5_values
-
-        op2_keys = list(op2_trimmed.keys())
-        h5_keys = list(h5_trimmed.keys())
-
-        matrix = np.full((len(op2_keys), len(h5_keys)), np.nan)
-
-        for i, op2_k in enumerate(op2_keys):
-            for j, h5_k in enumerate(h5_keys):
-                x = op2_trimmed[op2_k]
-                y = h5_trimmed[h5_k]
-
-                # NaN ve sıfır-varyans kontrolü
-                valid = np.isfinite(x) & np.isfinite(y)
-                if valid.sum() < 3:
-                    continue
-
-                x_valid = x[valid]
-                y_valid = y[valid]
-
-                if np.std(x_valid) < 1e-15 or np.std(y_valid) < 1e-15:
-                    matrix[i, j] = 0.0
-                    continue
-
-                r, _ = stats.pearsonr(x_valid, y_valid)
-                matrix[i, j] = r
-
-        return pd.DataFrame(matrix, index=op2_keys, columns=h5_keys)
-
-    @staticmethod
-    def _compute_regressions(
-        op2_values: Dict[str, np.ndarray],
-        h5_values: Dict[str, np.ndarray],
-    ) -> Dict[str, Dict[str, Tuple]]:
-        """Her H5 kolonu için her OP2 kolonuyla lineer regresyon."""
-        results = {}
-
-        # Uzunluk eşitleme
-        lengths = set()
-        for v in list(op2_values.values()) + list(h5_values.values()):
-            lengths.add(len(v))
-
-        min_len = min(lengths) if lengths else 0
-        op2_trimmed = {k: v[:min_len] for k, v in op2_values.items()}
-        h5_trimmed = {k: v[:min_len] for k, v in h5_values.items()}
-
-        for h5_col, h5_arr in h5_trimmed.items():
-            results[h5_col] = {}
-            for op2_col, op2_arr in op2_trimmed.items():
-                valid = np.isfinite(op2_arr) & np.isfinite(h5_arr)
-                if valid.sum() < 3:
-                    continue
-
-                x = op2_arr[valid]
-                y = h5_arr[valid]
-
-                if np.std(x) < 1e-15:
-                    continue
-
-                try:
-                    slope, intercept, r_value, p_value, std_err = stats.linregress(x, y)
-                    results[h5_col][op2_col] = (slope, intercept, r_value, p_value, std_err)
-                except Exception as e:
-                    logger.warning(
-                        "Regresyon hatasi (%s vs %s): %s", op2_col, h5_col, e
-                    )
-
-        return results
-
-    @staticmethod
     def _normalize(s: str) -> str:
-        """Kolon isimlerini normalize et (karşılaştırma için)."""
+        """Kolon isimlerini normalize et."""
         return s.lower().replace(" ", "").replace("_", "").strip()

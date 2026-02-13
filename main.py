@@ -33,7 +33,7 @@ import pandas as pd
 from joint_load_extractor.bdf_parser import BDFParser, BarElementInfo
 from joint_load_extractor.op2_reader import OP2Reader, BarForceResult, ShellForceResult
 from joint_load_extractor.h5_reader import H5Reader
-from joint_load_extractor.correlation import CorrelationEngine, CorrelationResult
+from joint_load_extractor.correlation import CorrelationEngine, JointCorrelationResult
 from joint_load_extractor.reporter import ReportGenerator
 
 
@@ -151,32 +151,15 @@ def run_correlation_analysis(
     shell_forces: Dict[Tuple[int, int], ShellForceResult],
     h5_reader: H5Reader,
     subcase_id: int = None,
-) -> Tuple[CorrelationEngine, List[CorrelationResult]]:
+) -> Tuple[CorrelationEngine, List[JointCorrelationResult]]:
     """
-    Korelasyon analizini çalıştır.
+    Korelasyon analizini calistir.
 
-    Her bar element için:
-    1. BAR korelasyonu: Axial/Shear vs FBearingX/FBearingY
-    2. QUAD korelasyonu: NX/NY/NXY vs NX/NY/NXY Bypass (her quad ayrı)
-    3. TRIA korelasyonu: NX/NY/NXY vs NX/NY/NXY Bypass (her tria ayrı)
-    4. COMBINED: Tüm kuvvetler birlikte
+    Her bar element icin coklu regresyon denklemi:
+      Target = a1*Bar_Axial + a2*Avg_Nx + a3*Avg_Ny + a4*Avg_Nxy + b
 
-    Parameters
-    ----------
-    connectivity : Dict[int, BarElementInfo]
-        Bar element bağlantı bilgileri.
-    bar_forces : Dict[Tuple[int, int], BarForceResult]
-        Bar element kuvvetleri.
-    shell_forces : Dict[Tuple[int, int], ShellForceResult]
-        Shell element fluxları.
-    h5_reader : H5Reader
-        H5 okuyucu.
-    subcase_id : int, optional
-        Subcase ID. None ise ilk bulunandan kullanılır.
-
-    Returns
-    -------
-    Tuple[CorrelationEngine, List[CorrelationResult]]
+    Predictors (OP2):  Bar Axial + Avg Shell Nx/Ny/Nxy
+    Targets (H5):      F Bearing X/Y, NX/NY/NXY Bypass
     """
     logger = logging.getLogger(__name__)
     engine = CorrelationEngine()
@@ -185,13 +168,11 @@ def run_correlation_analysis(
     for bar_eid, info in sorted(connectivity.items()):
         logger.info("Bar %d icin korelasyon hesaplaniyor...", bar_eid)
 
-        # H5'ten bu bar element için verileri al
         h5_data = h5_reader.get_joint_loads_for_bar(bar_eid)
         if h5_data is None or h5_data.empty:
             logger.warning("Bar %d icin H5 verisi bulunamadi", bar_eid)
             continue
 
-        # Subcase belirleme
         sc_keys = [k for k in bar_forces.keys() if k[1] == bar_eid]
         if not sc_keys:
             logger.warning("Bar %d icin OP2 kuvvet verisi yok", bar_eid)
@@ -205,79 +186,34 @@ def run_correlation_analysis(
             if bar_result is None:
                 continue
 
-            # 1. BAR korelasyonu
-            bar_corr = engine.compute_bar_correlation(
-                bar_eid=bar_eid,
-                subcase_id=sc_id_key,
-                bar_axial=bar_result.axial_force,
-                bar_shear1=bar_result.shear_1,
-                bar_shear2=bar_result.shear_2,
-                bar_torque=bar_result.torque,
-                h5_data=h5_data,
-            )
-            all_results.append(bar_corr)
-
-            # 2. Her bağlı QUAD element için korelasyon
-            for qeid in info.connected_quads:
-                shell_res = shell_forces.get((sc_id_key, qeid))
-                if shell_res is None:
-                    continue
-
-                quad_corr = engine.compute_shell_correlation(
-                    bar_eid=bar_eid,
-                    subcase_id=sc_id_key,
-                    shell_eid=qeid,
-                    elem_type="CQUAD4",
-                    nx=shell_res.membrane_x,
-                    ny=shell_res.membrane_y,
-                    nxy=shell_res.membrane_xy,
-                    h5_data=h5_data,
-                )
-                all_results.append(quad_corr)
-
-            # 3. Her bağlı TRIA element için korelasyon
-            for teid in info.connected_trias:
-                shell_res = shell_forces.get((sc_id_key, teid))
-                if shell_res is None:
-                    continue
-
-                tria_corr = engine.compute_shell_correlation(
-                    bar_eid=bar_eid,
-                    subcase_id=sc_id_key,
-                    shell_eid=teid,
-                    elem_type="CTRIA3",
-                    nx=shell_res.membrane_x,
-                    ny=shell_res.membrane_y,
-                    nxy=shell_res.membrane_xy,
-                    h5_data=h5_data,
-                )
-                all_results.append(tria_corr)
-
-            # 4. COMBINED korelasyon
-            shell_force_dict = {}
-            shell_type_dict = {}
+            # Bagli tum shell'lerin Nx, Ny, Nxy ortalamasi
+            all_nx, all_ny, all_nxy = [], [], []
             for seid in list(info.connected_quads.keys()) + list(info.connected_trias.keys()):
                 sf = shell_forces.get((sc_id_key, seid))
                 if sf is not None:
-                    shell_force_dict[seid] = {
-                        "NX": sf.membrane_x,
-                        "NY": sf.membrane_y,
-                        "NXY": sf.membrane_xy,
-                    }
-                    shell_type_dict[seid] = sf.elem_type
+                    all_nx.append(sf.membrane_x)
+                    all_ny.append(sf.membrane_y)
+                    all_nxy.append(sf.membrane_xy)
 
-            if shell_force_dict:
-                combined_corr = engine.compute_combined_correlation(
-                    bar_eid=bar_eid,
-                    subcase_id=sc_id_key,
-                    bar_axial=bar_result.axial_force,
-                    bar_shear1=bar_result.shear_1,
-                    bar_shear2=bar_result.shear_2,
-                    shell_forces=shell_force_dict,
-                    h5_data=h5_data,
-                    shell_types=shell_type_dict,
-                )
-                all_results.append(combined_corr)
+            if not all_nx:
+                logger.warning("Bar %d (SC %d): Bagli shell kuvveti yok", bar_eid, sc_id_key)
+                continue
+
+            avg_nx = np.mean(all_nx, axis=0)
+            avg_ny = np.mean(all_ny, axis=0)
+            avg_nxy = np.mean(all_nxy, axis=0)
+
+            result = engine.compute_joint_correlation(
+                bar_eid=bar_eid,
+                subcase_id=sc_id_key,
+                bar_axial=bar_result.axial_force,
+                avg_shell_nx=avg_nx,
+                avg_shell_ny=avg_ny,
+                avg_shell_nxy=avg_nxy,
+                h5_data=h5_data,
+                n_shells=len(all_nx),
+            )
+            all_results.append(result)
 
     return engine, all_results
 

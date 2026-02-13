@@ -33,7 +33,7 @@ import numpy as np
 import pandas as pd
 from pyNastran.bdf.bdf import BDF
 from pyNastran.op2.op2 import OP2
-from scipy import stats
+
 
 
 # ============================================================
@@ -770,151 +770,125 @@ class H5Reader:
 
 
 @dataclass
-class CorrelationResult:
-    """Bir bar element icin korelasyon sonuclari."""
+class RegressionEquation:
+    """Tek bir hedef icin coklu regresyon denklemi."""
+    target_name: str
+    predictor_names: List[str]
+    coefficients: np.ndarray
+    intercept: float
+    r_squared: float
+    n_samples: int
+
+    def equation_str(self) -> str:
+        parts = []
+        for name, coeff in zip(self.predictor_names, self.coefficients):
+            parts.append(f"{coeff:+.6f}*{name}")
+        return f"{self.target_name} = {' '.join(parts)} {self.intercept:+.6f}"
+
+
+@dataclass
+class JointCorrelationResult:
+    """Bir bar element icin tum korelasyon sonuclari."""
     bar_eid: int
     subcase_id: int
-    element_type: str
+    n_connected_shells: int
+    equations: List[RegressionEquation] = field(default_factory=list)
+    predictor_data: Dict[str, np.ndarray] = field(default_factory=dict)
+    target_data: Dict[str, np.ndarray] = field(default_factory=dict)
 
-    op2_values: Dict[str, np.ndarray] = field(default_factory=dict)
-    h5_values: Dict[str, np.ndarray] = field(default_factory=dict)
-    correlation_matrix: Optional[pd.DataFrame] = None
-    regression_results: Dict[str, Dict[str, Tuple]] = field(default_factory=dict)
+
+# Geriye uyumluluk icin alias
+CorrelationResult = JointCorrelationResult
 
 
 class CorrelationEngine:
-    """OP2 kuvvetleri ile H5 JOINT_LOADS_CAP arasinda korelasyon hesaplar."""
+    """OP2 kuvvetleri ile H5 JOINT_LOADS_CAP arasinda coklu regresyon hesaplar."""
 
     H5_TARGET_COLUMNS = ["F Bearing X", "F Bearing Y", "NX Bypass", "NY Bypass", "NXY Bypass"]
 
     def __init__(self):
-        self.results: List[CorrelationResult] = []
+        self.results: List[JointCorrelationResult] = []
 
-    def compute_bar_correlation(
+    def compute_joint_correlation(
         self,
         bar_eid: int,
         subcase_id: int,
         bar_axial: np.ndarray,
-        bar_shear1: np.ndarray,
-        bar_shear2: np.ndarray,
-        bar_torque: np.ndarray,
+        avg_shell_nx: np.ndarray,
+        avg_shell_ny: np.ndarray,
+        avg_shell_nxy: np.ndarray,
         h5_data: pd.DataFrame,
-    ) -> CorrelationResult:
-        result = CorrelationResult(
-            bar_eid=bar_eid, subcase_id=subcase_id, element_type="BAR",
+        n_shells: int,
+    ) -> JointCorrelationResult:
+        """Coklu regresyon: Target = a1*Axial + a2*Nx + a3*Ny + a4*Nxy + b"""
+        logger = logging.getLogger(__name__)
+        result = JointCorrelationResult(
+            bar_eid=bar_eid, subcase_id=subcase_id, n_connected_shells=n_shells,
         )
 
-        result.op2_values = {
-            "Axial_Force": bar_axial,
-            "Shear_1": bar_shear1,
-            "Shear_2": bar_shear2,
-            "Torque": bar_torque,
+        predictors = {
+            "Bar_Axial": np.asarray(bar_axial, dtype=float),
+            "Avg_Shell_Nx": np.asarray(avg_shell_nx, dtype=float),
+            "Avg_Shell_Ny": np.asarray(avg_shell_ny, dtype=float),
+            "Avg_Shell_Nxy": np.asarray(avg_shell_nxy, dtype=float),
         }
+        result.predictor_data = predictors
 
+        targets = {}
         for col in self.H5_TARGET_COLUMNS:
-            matching_cols = [c for c in h5_data.columns if self._normalize(c) == self._normalize(col)]
-            if matching_cols:
-                result.h5_values[col] = h5_data[matching_cols[0]].values
+            matching = [c for c in h5_data.columns
+                        if self._normalize(c) == self._normalize(col)]
+            if matching:
+                targets[col] = h5_data[matching[0]].values.astype(float)
+        result.target_data = targets
 
-        result.correlation_matrix = self._compute_correlation_matrix(
-            result.op2_values, result.h5_values
-        )
-        result.regression_results = self._compute_regressions(
-            result.op2_values, result.h5_values
-        )
+        if not targets:
+            logger.warning("Bar %d: H5 hedef kolonlari bulunamadi", bar_eid)
+            self.results.append(result)
+            return result
 
-        self.results.append(result)
-        return result
+        all_arrays = list(predictors.values()) + list(targets.values())
+        min_len = min(len(a) for a in all_arrays)
+        if min_len < 5:
+            logger.warning("Bar %d: Yetersiz veri (%d)", bar_eid, min_len)
+            self.results.append(result)
+            return result
 
-    def compute_shell_correlation(
-        self,
-        bar_eid: int,
-        subcase_id: int,
-        shell_eid: int,
-        elem_type: str,
-        nx: np.ndarray,
-        ny: np.ndarray,
-        nxy: np.ndarray,
-        h5_data: pd.DataFrame,
-    ) -> CorrelationResult:
-        result = CorrelationResult(
-            bar_eid=bar_eid, subcase_id=subcase_id,
-            element_type=f"{elem_type}_{shell_eid}",
-        )
+        X_raw = np.column_stack([v[:min_len] for v in predictors.values()])
 
-        result.op2_values = {
-            "NX_Flux": nx, "NY_Flux": ny, "NXY_Flux": nxy,
-        }
+        for target_name, target_arr in targets.items():
+            y = target_arr[:min_len]
+            valid = np.all(np.isfinite(X_raw), axis=1) & np.isfinite(y)
+            n_valid = int(valid.sum())
+            if n_valid < 5:
+                continue
 
-        for col in self.H5_TARGET_COLUMNS:
-            matching_cols = [c for c in h5_data.columns if self._normalize(c) == self._normalize(col)]
-            if matching_cols:
-                result.h5_values[col] = h5_data[matching_cols[0]].values
+            X = X_raw[valid]
+            y_valid = y[valid]
+            X_aug = np.column_stack([X, np.ones(X.shape[0])])
 
-        result.correlation_matrix = self._compute_correlation_matrix(
-            result.op2_values, result.h5_values
-        )
-        result.regression_results = self._compute_regressions(
-            result.op2_values, result.h5_values
-        )
+            try:
+                coeffs, _, _, _ = np.linalg.lstsq(X_aug, y_valid, rcond=None)
+            except np.linalg.LinAlgError as e:
+                logger.warning("Bar %d, %s: lstsq hatasi: %s", bar_eid, target_name, e)
+                continue
 
-        self.results.append(result)
-        return result
+            y_pred = X_aug @ coeffs
+            ss_res = np.sum((y_valid - y_pred) ** 2)
+            ss_tot = np.sum((y_valid - np.mean(y_valid)) ** 2)
+            r_squared = 1.0 - ss_res / ss_tot if ss_tot > 1e-15 else 0.0
 
-    def compute_combined_correlation(
-        self,
-        bar_eid: int,
-        subcase_id: int,
-        bar_axial: np.ndarray,
-        bar_shear1: np.ndarray,
-        bar_shear2: np.ndarray,
-        shell_forces: Dict[int, Dict[str, np.ndarray]],
-        h5_data: pd.DataFrame,
-        shell_types: Dict[int, str],
-    ) -> CorrelationResult:
-        result = CorrelationResult(
-            bar_eid=bar_eid, subcase_id=subcase_id, element_type="COMBINED",
-        )
-
-        result.op2_values["Bar_Axial"] = bar_axial
-        result.op2_values["Bar_Shear1"] = bar_shear1
-        result.op2_values["Bar_Shear2"] = bar_shear2
-
-        quad_nx, quad_ny, quad_nxy = [], [], []
-        tria_nx, tria_ny, tria_nxy = [], [], []
-
-        for seid, forces in shell_forces.items():
-            stype = shell_types.get(seid, "UNKNOWN")
-            if "QUAD" in stype:
-                quad_nx.append(forces.get("NX", np.zeros_like(bar_axial)))
-                quad_ny.append(forces.get("NY", np.zeros_like(bar_axial)))
-                quad_nxy.append(forces.get("NXY", np.zeros_like(bar_axial)))
-            elif "TRI" in stype:
-                tria_nx.append(forces.get("NX", np.zeros_like(bar_axial)))
-                tria_ny.append(forces.get("NY", np.zeros_like(bar_axial)))
-                tria_nxy.append(forces.get("NXY", np.zeros_like(bar_axial)))
-
-        if quad_nx:
-            result.op2_values["Avg_QUAD_NX"] = np.mean(quad_nx, axis=0)
-            result.op2_values["Avg_QUAD_NY"] = np.mean(quad_ny, axis=0)
-            result.op2_values["Avg_QUAD_NXY"] = np.mean(quad_nxy, axis=0)
-
-        if tria_nx:
-            result.op2_values["Avg_TRIA_NX"] = np.mean(tria_nx, axis=0)
-            result.op2_values["Avg_TRIA_NY"] = np.mean(tria_ny, axis=0)
-            result.op2_values["Avg_TRIA_NXY"] = np.mean(tria_nxy, axis=0)
-
-        for col in self.H5_TARGET_COLUMNS:
-            matching_cols = [c for c in h5_data.columns if self._normalize(c) == self._normalize(col)]
-            if matching_cols:
-                result.h5_values[col] = h5_data[matching_cols[0]].values
-
-        result.correlation_matrix = self._compute_correlation_matrix(
-            result.op2_values, result.h5_values
-        )
-        result.regression_results = self._compute_regressions(
-            result.op2_values, result.h5_values
-        )
+            eq = RegressionEquation(
+                target_name=target_name,
+                predictor_names=list(predictors.keys()),
+                coefficients=coeffs[:-1],
+                intercept=coeffs[-1],
+                r_squared=max(0.0, r_squared),
+                n_samples=n_valid,
+            )
+            result.equations.append(eq)
+            logger.info("Bar %d | %s | R²=%.4f | n=%d",
+                        bar_eid, eq.equation_str(), r_squared, n_valid)
 
         self.results.append(result)
         return result
@@ -922,108 +896,21 @@ class CorrelationEngine:
     def get_summary_dataframe(self) -> pd.DataFrame:
         rows = []
         for res in self.results:
-            if res.correlation_matrix is None:
-                continue
-            for h5_col in res.correlation_matrix.columns:
-                for op2_col in res.correlation_matrix.index:
-                    r_val = res.correlation_matrix.loc[op2_col, h5_col]
-                    reg = res.regression_results.get(h5_col, {}).get(op2_col)
-                    row = {
-                        "Bar_EID": res.bar_eid,
-                        "Subcase_ID": res.subcase_id,
-                        "Element_Type": res.element_type,
-                        "OP2_Parameter": op2_col,
-                        "H5_Parameter": h5_col,
-                        "Pearson_R": r_val,
-                        "R_Squared": r_val ** 2 if not np.isnan(r_val) else np.nan,
-                    }
-                    if reg is not None:
-                        row["Slope"] = reg[0]
-                        row["Intercept"] = reg[1]
-                        row["P_Value"] = reg[3]
-                        row["Std_Error"] = reg[4]
-                    rows.append(row)
+            for eq in res.equations:
+                row = {
+                    "Bar_EID": res.bar_eid,
+                    "Subcase_ID": res.subcase_id,
+                    "N_Shells": res.n_connected_shells,
+                    "Target": eq.target_name,
+                    "R_Squared": eq.r_squared,
+                    "N_Samples": eq.n_samples,
+                    "Intercept": eq.intercept,
+                }
+                for pname, coeff in zip(eq.predictor_names, eq.coefficients):
+                    row[f"Coeff_{pname}"] = coeff
+                row["Equation"] = eq.equation_str()
+                rows.append(row)
         return pd.DataFrame(rows)
-
-    @staticmethod
-    def _compute_correlation_matrix(
-        op2_values: Dict[str, np.ndarray],
-        h5_values: Dict[str, np.ndarray],
-    ) -> Optional[pd.DataFrame]:
-        logger = logging.getLogger(__name__)
-        if not op2_values or not h5_values:
-            return None
-
-        lengths = set()
-        for v in list(op2_values.values()) + list(h5_values.values()):
-            lengths.add(len(v))
-
-        if len(lengths) > 1:
-            min_len = min(lengths)
-            logger.warning(
-                "Farkli veri uzunluklari: %s. %d'ye kesiliyor.",
-                lengths, min_len,
-            )
-            op2_trimmed = {k: v[:min_len] for k, v in op2_values.items()}
-            h5_trimmed = {k: v[:min_len] for k, v in h5_values.items()}
-        else:
-            op2_trimmed = op2_values
-            h5_trimmed = h5_values
-
-        op2_keys = list(op2_trimmed.keys())
-        h5_keys = list(h5_trimmed.keys())
-        matrix = np.full((len(op2_keys), len(h5_keys)), np.nan)
-
-        for i, op2_k in enumerate(op2_keys):
-            for j, h5_k in enumerate(h5_keys):
-                x = op2_trimmed[op2_k]
-                y = h5_trimmed[h5_k]
-                valid = np.isfinite(x) & np.isfinite(y)
-                if valid.sum() < 3:
-                    continue
-                x_valid = x[valid]
-                y_valid = y[valid]
-                if np.std(x_valid) < 1e-15 or np.std(y_valid) < 1e-15:
-                    matrix[i, j] = 0.0
-                    continue
-                r, _ = stats.pearsonr(x_valid, y_valid)
-                matrix[i, j] = r
-
-        return pd.DataFrame(matrix, index=op2_keys, columns=h5_keys)
-
-    @staticmethod
-    def _compute_regressions(
-        op2_values: Dict[str, np.ndarray],
-        h5_values: Dict[str, np.ndarray],
-    ) -> Dict[str, Dict[str, Tuple]]:
-        logger = logging.getLogger(__name__)
-        results = {}
-        lengths = set()
-        for v in list(op2_values.values()) + list(h5_values.values()):
-            lengths.add(len(v))
-
-        min_len = min(lengths) if lengths else 0
-        op2_trimmed = {k: v[:min_len] for k, v in op2_values.items()}
-        h5_trimmed = {k: v[:min_len] for k, v in h5_values.items()}
-
-        for h5_col, h5_arr in h5_trimmed.items():
-            results[h5_col] = {}
-            for op2_col, op2_arr in op2_trimmed.items():
-                valid = np.isfinite(op2_arr) & np.isfinite(h5_arr)
-                if valid.sum() < 3:
-                    continue
-                x = op2_arr[valid]
-                y = h5_arr[valid]
-                if np.std(x) < 1e-15:
-                    continue
-                try:
-                    slope, intercept, r_value, p_value, std_err = stats.linregress(x, y)
-                    results[h5_col][op2_col] = (slope, intercept, r_value, p_value, std_err)
-                except Exception as e:
-                    logger.warning(
-                        "Regresyon hatasi (%s vs %s): %s", op2_col, h5_col, e
-                    )
-        return results
 
     @staticmethod
     def _normalize(s: str) -> str:
@@ -1199,11 +1086,17 @@ class ReportGenerator:
         self, writer, workbook, connectivity, correlation_results,
         header_fmt, number_fmt, int_fmt, bar_fmt, quad_fmt, tria_fmt, border_fmt,
     ):
+        """Her bar element icin detay sheet'i - regresyon denklemleri."""
         bar_results = {}
         for res in correlation_results:
             if res.bar_eid not in bar_results:
                 bar_results[res.bar_eid] = []
             bar_results[res.bar_eid].append(res)
+
+        good_r2_fmt = workbook.add_format({
+            "num_format": "0.0000", "border": 1, "bg_color": self.CORR_POS_COLOR,
+        })
+        eq_fmt = workbook.add_format({"border": 1, "text_wrap": True, "font_size": 9})
 
         for bar_eid, results in sorted(bar_results.items()):
             sheet_name = f"Bar_{bar_eid}"[:31]
@@ -1211,10 +1104,11 @@ class ReportGenerator:
             row = 0
 
             title_fmt = workbook.add_format({"bold": True, "font_size": 14, "bottom": 2})
-            ws.write(row, 0, f"Bar Element {bar_eid} - Detail", title_fmt)
+            ws.write(row, 0, f"Bar Element {bar_eid} - Regression", title_fmt)
             row += 2
 
             ws.write(row, 0, "Element Connectivity", header_fmt)
+            ws.merge_range(row, 0, row, 1, "Element Connectivity", header_fmt)
             row += 1
             info = connectivity.get(bar_eid)
             if info:
@@ -1235,57 +1129,49 @@ class ReportGenerator:
                 row += 2
 
             for res in results:
-                ws.write(row, 0, f"Correlation: {res.element_type}", header_fmt)
-                ws.merge_range(row, 0, row, 5, f"Correlation: {res.element_type}", header_fmt)
+                ws.write(row, 0, f"Subcase {res.subcase_id} | {res.n_connected_shells} shell", header_fmt)
+                ws.merge_range(
+                    row, 0, row, 6,
+                    f"Multiple Regression (SC {res.subcase_id}, {res.n_connected_shells} shells)",
+                    header_fmt,
+                )
                 row += 1
 
-                if res.correlation_matrix is not None and not res.correlation_matrix.empty:
-                    corr = res.correlation_matrix
-                    ws.write(row, 0, "OP2 \\ H5", header_fmt)
-                    for j, h5_col in enumerate(corr.columns):
-                        ws.write(row, j + 1, h5_col, header_fmt)
+                if not res.equations:
+                    ws.write(row, 0, "Denklem hesaplanamadi", border_fmt)
+                    row += 2
+                    continue
+
+                eq_headers = [
+                    "Target", "Coeff Bar_Axial", "Coeff Avg_Nx",
+                    "Coeff Avg_Ny", "Coeff Avg_Nxy", "Intercept", "R²",
+                ]
+                for j, h in enumerate(eq_headers):
+                    ws.write(row, j, h, header_fmt)
+                row += 1
+
+                for eq in res.equations:
+                    ws.write(row, 0, eq.target_name, border_fmt)
+                    for ci, coeff in enumerate(eq.coefficients):
+                        ws.write(row, ci + 1, float(coeff), number_fmt)
+                    ws.write(row, 5, float(eq.intercept), number_fmt)
+                    r2_fmt = good_r2_fmt if eq.r_squared >= 0.7 else number_fmt
+                    ws.write(row, 6, eq.r_squared, r2_fmt)
                     row += 1
 
-                    for i, op2_col in enumerate(corr.index):
-                        ws.write(row, 0, op2_col, border_fmt)
-                        for j, h5_col in enumerate(corr.columns):
-                            val = corr.iloc[i, j]
-                            if np.isnan(val):
-                                ws.write(row, j + 1, "N/A", border_fmt)
-                            else:
-                                if abs(val) >= 0.7:
-                                    cell_fmt = workbook.add_format({
-                                        "num_format": "0.0000", "border": 1,
-                                        "bg_color": self.CORR_POS_COLOR if val > 0 else self.CORR_NEG_COLOR,
-                                    })
-                                else:
-                                    cell_fmt = number_fmt
-                                ws.write(row, j + 1, val, cell_fmt)
-                        row += 1
-                    row += 1
+                row += 1
 
-                if res.regression_results:
-                    ws.write(row, 0, "Regression Results", header_fmt)
-                    ws.merge_range(row, 0, row, 6, f"Regression: {res.element_type}", header_fmt)
+                ws.write(row, 0, "Equations", header_fmt)
+                ws.merge_range(row, 0, row, 6, "Equations", header_fmt)
+                row += 1
+                for eq in res.equations:
+                    ws.merge_range(row, 0, row, 6, eq.equation_str(), eq_fmt)
                     row += 1
-                    reg_headers = ["H5 Target", "OP2 Predictor", "Slope", "Intercept", "R^2", "P-Value", "Std Error"]
-                    for j, h in enumerate(reg_headers):
-                        ws.write(row, j, h, header_fmt)
-                    row += 1
-                    for h5_col, op2_dict in res.regression_results.items():
-                        for op2_col, (slope, intercept, r_val, p_val, std_err) in op2_dict.items():
-                            ws.write(row, 0, h5_col, border_fmt)
-                            ws.write(row, 1, op2_col, border_fmt)
-                            ws.write(row, 2, slope, number_fmt)
-                            ws.write(row, 3, intercept, number_fmt)
-                            ws.write(row, 4, r_val ** 2, number_fmt)
-                            ws.write(row, 5, p_val, number_fmt)
-                            ws.write(row, 6, std_err, number_fmt)
-                            row += 1
-                    row += 1
+                row += 1
 
-            ws.set_column(0, 0, 20)
-            ws.set_column(1, 6, 16)
+            ws.set_column(0, 0, 18)
+            ws.set_column(1, 5, 16)
+            ws.set_column(6, 6, 12)
 
 
 # ============================================================
@@ -1388,8 +1274,12 @@ def run_correlation_analysis(
     shell_forces: Dict[Tuple[int, int], ShellForceResult],
     h5_reader: H5Reader,
     subcase_id: int = None,
-) -> Tuple[CorrelationEngine, List[CorrelationResult]]:
-    """Korelasyon analizini calistir."""
+) -> Tuple[CorrelationEngine, List[JointCorrelationResult]]:
+    """Korelasyon analizini calistir.
+
+    Her bar element icin coklu regresyon denklemi:
+      Target = a1*Bar_Axial + a2*Avg_Nx + a3*Avg_Ny + a4*Avg_Nxy + b
+    """
     logger = logging.getLogger(__name__)
     engine = CorrelationEngine()
     all_results = []
@@ -1415,67 +1305,34 @@ def run_correlation_analysis(
             if bar_result is None:
                 continue
 
-            bar_corr = engine.compute_bar_correlation(
-                bar_eid=bar_eid, subcase_id=sc_id_key,
-                bar_axial=bar_result.axial_force,
-                bar_shear1=bar_result.shear_1,
-                bar_shear2=bar_result.shear_2,
-                bar_torque=bar_result.torque,
-                h5_data=h5_data,
-            )
-            all_results.append(bar_corr)
-
-            for qeid in info.connected_quads:
-                shell_res = shell_forces.get((sc_id_key, qeid))
-                if shell_res is None:
-                    continue
-                quad_corr = engine.compute_shell_correlation(
-                    bar_eid=bar_eid, subcase_id=sc_id_key,
-                    shell_eid=qeid, elem_type="CQUAD4",
-                    nx=shell_res.membrane_x,
-                    ny=shell_res.membrane_y,
-                    nxy=shell_res.membrane_xy,
-                    h5_data=h5_data,
-                )
-                all_results.append(quad_corr)
-
-            for teid in info.connected_trias:
-                shell_res = shell_forces.get((sc_id_key, teid))
-                if shell_res is None:
-                    continue
-                tria_corr = engine.compute_shell_correlation(
-                    bar_eid=bar_eid, subcase_id=sc_id_key,
-                    shell_eid=teid, elem_type="CTRIA3",
-                    nx=shell_res.membrane_x,
-                    ny=shell_res.membrane_y,
-                    nxy=shell_res.membrane_xy,
-                    h5_data=h5_data,
-                )
-                all_results.append(tria_corr)
-
-            shell_force_dict = {}
-            shell_type_dict = {}
+            # Bagli tum shell'lerin Nx, Ny, Nxy ortalamasi
+            all_nx, all_ny, all_nxy = [], [], []
             for seid in list(info.connected_quads.keys()) + list(info.connected_trias.keys()):
                 sf = shell_forces.get((sc_id_key, seid))
                 if sf is not None:
-                    shell_force_dict[seid] = {
-                        "NX": sf.membrane_x,
-                        "NY": sf.membrane_y,
-                        "NXY": sf.membrane_xy,
-                    }
-                    shell_type_dict[seid] = sf.elem_type
+                    all_nx.append(sf.membrane_x)
+                    all_ny.append(sf.membrane_y)
+                    all_nxy.append(sf.membrane_xy)
 
-            if shell_force_dict:
-                combined_corr = engine.compute_combined_correlation(
-                    bar_eid=bar_eid, subcase_id=sc_id_key,
-                    bar_axial=bar_result.axial_force,
-                    bar_shear1=bar_result.shear_1,
-                    bar_shear2=bar_result.shear_2,
-                    shell_forces=shell_force_dict,
-                    h5_data=h5_data,
-                    shell_types=shell_type_dict,
-                )
-                all_results.append(combined_corr)
+            if not all_nx:
+                logger.warning("Bar %d (SC %d): Bagli shell kuvveti yok", bar_eid, sc_id_key)
+                continue
+
+            avg_nx = np.mean(all_nx, axis=0)
+            avg_ny = np.mean(all_ny, axis=0)
+            avg_nxy = np.mean(all_nxy, axis=0)
+
+            result = engine.compute_joint_correlation(
+                bar_eid=bar_eid,
+                subcase_id=sc_id_key,
+                bar_axial=bar_result.axial_force,
+                avg_shell_nx=avg_nx,
+                avg_shell_ny=avg_ny,
+                avg_shell_nxy=avg_nxy,
+                h5_data=h5_data,
+                n_shells=len(all_nx),
+            )
+            all_results.append(result)
 
     return engine, all_results
 
