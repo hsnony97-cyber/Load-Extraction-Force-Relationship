@@ -296,19 +296,23 @@ Ornek kullanim:
     )
 
     parser.add_argument(
-        "--bdf", required=True,
+        "--gui", action="store_true",
+        help="Tkinter grafik arayuzu ile baslat",
+    )
+    parser.add_argument(
+        "--bdf", required=False, default=None,
         help="Nastran BDF dosyasi yolu",
     )
     parser.add_argument(
-        "--op2", required=True,
+        "--op2", required=False, default=None,
         help="Nastran OP2 dosyasi yolu",
     )
     parser.add_argument(
-        "--h5", required=True,
+        "--h5", required=False, default=None,
         help="Joint Load Extraction H5 dosyasi yolu",
     )
     parser.add_argument(
-        "--excel", required=True,
+        "--excel", required=False, default=None,
         help="Bar Element Set iceren Excel dosyasi yolu",
     )
     parser.add_argument(
@@ -329,6 +333,23 @@ Ornek kullanim:
     )
 
     args = parser.parse_args()
+
+    # GUI modu
+    if args.gui:
+        from gui import Application
+        app = Application()
+        app.mainloop()
+        return
+
+    # CLI modu: dosya parametreleri zorunlu
+    missing = []
+    for param in ["bdf", "op2", "h5", "excel"]:
+        if getattr(args, param) is None:
+            missing.append(f"--{param}")
+    if missing:
+        parser.error(f"CLI modunda su parametreler zorunludur: {', '.join(missing)}\n"
+                     f"Grafik arayuz icin: python main.py --gui")
+
     setup_logging(args.verbose)
     logger = logging.getLogger(__name__)
 
