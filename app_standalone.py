@@ -135,7 +135,11 @@ class BDFParser:
             bdf_to_read = tmp_path
 
             self.model = BDF(debug=False)
-            self.model.read_bdf(bdf_to_read, xref=True, encoding="utf-8")
+            self.model.read_bdf(bdf_to_read, xref=False, encoding="utf-8")
+            try:
+                self.model.safe_cross_reference()
+            except Exception as e:
+                logger.warning("Cross-reference kismen basarisiz (eksik INCLUDE?): %s", e)
         finally:
             if tmp_path and os.path.exists(tmp_path):
                 os.remove(tmp_path)
