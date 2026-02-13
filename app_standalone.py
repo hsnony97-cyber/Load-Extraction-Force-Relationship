@@ -81,65 +81,29 @@ class BDFParser:
         logger = logging.getLogger(__name__)
         logger.info("BDF dosyasi okunuyor: %s", self.bdf_path)
 
-        # --- Oncelik 1: Dogrudan oku (read_includes=True) ---
+        # Tum INCLUDE'lari recursive olarak ac, bulunamayanlari atla
+        skipped_count = [0]
+        expanded = self._expand_includes_recursive(
+            self.bdf_path, visited=set(), skipped_count=skipped_count,
+        )
+        if skipped_count[0] > 0:
+            logger.info("%d erisilemez INCLUDE atlandi", skipped_count[0])
+
+        tmp_path = None
         try:
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix=".bdf")
+            os.close(tmp_fd)
+            with open(tmp_path, "w", encoding="utf-8") as dst:
+                dst.write("\n".join(expanded))
+
             self.model = BDF(debug=False)
             self.model.read_bdf(
-                self.bdf_path, validate=False, xref=False,
-                read_includes=True, encoding="latin-1",
+                tmp_path, validate=False, xref=False,
+                read_includes=False, encoding="utf-8",
             )
-        except Exception as e1:
-            logger.warning("Dogrudan okuma basarisiz: %s", e1)
-            logger.info("INCLUDE temizligi ile tekrar deneniyor...")
-
-            # --- Fallback: Erisilemez INCLUDE'lari kaldir ---
-            tmp_path = None
-            try:
-                content = self._read_file_safe(self.bdf_path)
-                lines = content.split("\n")
-
-                bdf_dir = os.path.dirname(os.path.abspath(self.bdf_path))
-                cleaned_lines = []
-                skipped = 0
-                for line in lines:
-                    stripped = line.strip().upper()
-                    if stripped.startswith("INCLUDE"):
-                        raw = line.strip()
-                        inc_file = None
-                        for q in ("'", '"'):
-                            start = raw.find(q)
-                            if start != -1:
-                                end = raw.find(q, start + 1)
-                                if end != -1:
-                                    inc_file = raw[start + 1:end]
-                                    break
-                        if inc_file is not None:
-                            if not os.path.isabs(inc_file):
-                                inc_file_full = os.path.join(bdf_dir, inc_file)
-                            else:
-                                inc_file_full = inc_file
-                            if not os.path.exists(inc_file_full):
-                                logger.warning("INCLUDE bulunamadi, atlaniyor: %s", inc_file)
-                                cleaned_lines.append("$ SKIPPED: " + line)
-                                skipped += 1
-                                continue
-                    cleaned_lines.append(line)
-
-                if skipped > 0:
-                    logger.info("%d erisilemez INCLUDE atlandi", skipped)
-
-                tmp_fd, tmp_path = tempfile.mkstemp(suffix=".bdf")
-                os.close(tmp_fd)
-                with open(tmp_path, "w", encoding="utf-8") as dst:
-                    dst.write("\n".join(cleaned_lines))
-
-                self.model = BDF(debug=False)
-                self.model.read_bdf(
-                    tmp_path, validate=False, xref=False, encoding="utf-8",
-                )
-            finally:
-                if tmp_path and os.path.exists(tmp_path):
-                    os.remove(tmp_path)
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
 
         logger.info(
             "BDF okundu: %d element, %d node",
@@ -147,6 +111,60 @@ class BDFParser:
             len(self.model.nodes),
         )
         self._build_node_element_maps()
+
+    @classmethod
+    def _expand_includes_recursive(
+        cls, bdf_path: str, visited: set, skipped_count: list,
+    ) -> list:
+        """INCLUDE dosyalarini recursive olarak acar, bulunamayanlari atlar."""
+        logger = logging.getLogger(__name__)
+        abs_path = os.path.abspath(bdf_path)
+        if abs_path in visited:
+            return [f"$ CIRCULAR INCLUDE SKIPPED: {abs_path}"]
+        visited.add(abs_path)
+
+        content = cls._read_file_safe(bdf_path)
+        bdf_dir = os.path.dirname(abs_path)
+        result = []
+
+        for line in content.split("\n"):
+            stripped = line.strip().upper()
+            if stripped.startswith("INCLUDE"):
+                inc_file = cls._parse_include_path(line)
+                if inc_file is not None:
+                    if not os.path.isabs(inc_file):
+                        inc_full = os.path.join(bdf_dir, inc_file)
+                    else:
+                        inc_full = inc_file
+                    if os.path.exists(inc_full):
+                        result.append(f"$ EXPANDED: {inc_file}")
+                        result.extend(
+                            cls._expand_includes_recursive(
+                                inc_full, visited, skipped_count,
+                            )
+                        )
+                    else:
+                        logger.warning("INCLUDE bulunamadi, atlaniyor: %s", inc_file)
+                        result.append(f"$ SKIPPED: {line.strip()}")
+                        skipped_count[0] += 1
+                else:
+                    result.append(line)
+            else:
+                result.append(line)
+
+        return result
+
+    @staticmethod
+    def _parse_include_path(line: str) -> str:
+        """INCLUDE satirindan dosya yolunu cikarir."""
+        raw = line.strip()
+        for q in ("'", '"'):
+            start = raw.find(q)
+            if start != -1:
+                end = raw.find(q, start + 1)
+                if end != -1:
+                    return raw[start + 1:end]
+        return None
 
     @staticmethod
     def _read_file_safe(fpath: str) -> str:
