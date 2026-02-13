@@ -1,0 +1,7 @@
+pyNastran>=1.4.0
+h5py>=3.7.0
+pandas>=1.5.0
+numpy>=1.23.0
+openpyxl>=3.0.10
+scipy>=1.9.0
+xlsxwriter>=3.0.0
