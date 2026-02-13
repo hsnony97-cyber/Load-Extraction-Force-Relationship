@@ -60,72 +60,83 @@ class BDFParser:
         """BDF dosyasını oku ve element verilerini indeksle."""
         logger.info("BDF dosyasi okunuyor: %s", self.bdf_path)
 
-        bdf_to_read = self.bdf_path
-        tmp_path = None
-
+        # --- Oncelik 1: Dogrudan oku (read_includes=True) ---
         try:
-            # --- 1. Encoding duzeltmesi ---
-            try:
-                with open(self.bdf_path, "r", encoding="utf-8") as f:
-                    lines = f.readlines()
-            except UnicodeDecodeError:
-                logger.warning("BDF dosyasi UTF-8 degil, latin-1 olarak yeniden kodlaniyor...")
-                with open(self.bdf_path, "r", encoding="latin-1") as f:
-                    lines = f.readlines()
-
-            # --- 2. Erisilemez INCLUDE satirlarini kaldir ---
-            bdf_dir = os.path.dirname(os.path.abspath(self.bdf_path))
-            cleaned_lines = []
-            skipped = 0
-            for line in lines:
-                stripped = line.strip().upper()
-                if stripped.startswith("INCLUDE"):
-                    raw = line.strip()
-                    inc_file = None
-                    for q in ("'", '"'):
-                        start = raw.find(q)
-                        if start != -1:
-                            end = raw.find(q, start + 1)
-                            if end != -1:
-                                inc_file = raw[start + 1:end]
-                                break
-                    if inc_file is not None:
-                        if not os.path.isabs(inc_file):
-                            inc_file_full = os.path.join(bdf_dir, inc_file)
-                        else:
-                            inc_file_full = inc_file
-                        if not os.path.exists(inc_file_full):
-                            logger.warning("INCLUDE dosyasi bulunamadi, atlaniyor: %s", inc_file)
-                            cleaned_lines.append("$ SKIPPED: " + line)
-                            skipped += 1
-                            continue
-                cleaned_lines.append(line)
-
-            if skipped > 0:
-                logger.info("%d erisilemez INCLUDE atlandi", skipped)
-
-            # Gecici dosyaya yaz (encoding + include temizligi)
-            tmp_fd, tmp_path = tempfile.mkstemp(suffix=".bdf")
-            os.close(tmp_fd)
-            with open(tmp_path, "w", encoding="utf-8") as dst:
-                dst.writelines(cleaned_lines)
-            bdf_to_read = tmp_path
-
             self.model = BDF(debug=False)
-            self.model.read_bdf(bdf_to_read, xref=False, encoding="utf-8")
+            self.model.read_bdf(
+                self.bdf_path, validate=False, xref=False,
+                read_includes=True, encoding="latin-1",
+            )
+        except Exception as e1:
+            logger.warning("Dogrudan okuma basarisiz: %s", e1)
+            logger.info("INCLUDE temizligi ile tekrar deneniyor...")
+
+            # --- Fallback: Erisilemez INCLUDE'lari kaldir ---
+            tmp_path = None
             try:
-                self.model.safe_cross_reference()
-            except Exception as e:
-                logger.warning("Cross-reference kismen basarisiz (eksik INCLUDE?): %s", e)
-        finally:
-            if tmp_path and os.path.exists(tmp_path):
-                os.remove(tmp_path)
+                content = self._read_file_safe(self.bdf_path)
+                lines = content.split("\n")
+
+                bdf_dir = os.path.dirname(os.path.abspath(self.bdf_path))
+                cleaned_lines = []
+                skipped = 0
+                for line in lines:
+                    stripped = line.strip().upper()
+                    if stripped.startswith("INCLUDE"):
+                        raw = line.strip()
+                        inc_file = None
+                        for q in ("'", '"'):
+                            start = raw.find(q)
+                            if start != -1:
+                                end = raw.find(q, start + 1)
+                                if end != -1:
+                                    inc_file = raw[start + 1:end]
+                                    break
+                        if inc_file is not None:
+                            if not os.path.isabs(inc_file):
+                                inc_file_full = os.path.join(bdf_dir, inc_file)
+                            else:
+                                inc_file_full = inc_file
+                            if not os.path.exists(inc_file_full):
+                                logger.warning("INCLUDE bulunamadi, atlaniyor: %s", inc_file)
+                                cleaned_lines.append("$ SKIPPED: " + line)
+                                skipped += 1
+                                continue
+                    cleaned_lines.append(line)
+
+                if skipped > 0:
+                    logger.info("%d erisilemez INCLUDE atlandi", skipped)
+
+                tmp_fd, tmp_path = tempfile.mkstemp(suffix=".bdf")
+                os.close(tmp_fd)
+                with open(tmp_path, "w", encoding="utf-8") as dst:
+                    dst.write("\n".join(cleaned_lines))
+
+                self.model = BDF(debug=False)
+                self.model.read_bdf(
+                    tmp_path, validate=False, xref=False, encoding="utf-8",
+                )
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+
         logger.info(
             "BDF okundu: %d element, %d node",
             len(self.model.elements),
             len(self.model.nodes),
         )
         self._build_node_element_maps()
+
+    @staticmethod
+    def _read_file_safe(fpath: str) -> str:
+        """Dosyayi guvenli sekilde oku (multi-encoding)."""
+        for enc in ("utf-8", "latin-1", "cp1252", "iso-8859-1"):
+            try:
+                with open(fpath, "r", encoding=enc, errors="replace") as f:
+                    return f.read()
+            except Exception:
+                continue
+        return ""
 
     def _build_node_element_maps(self) -> None:
         """Node-to-element haritalarını oluştur."""
