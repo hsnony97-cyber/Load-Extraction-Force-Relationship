@@ -57,7 +57,19 @@ class BDFParser:
         """BDF dosyasını oku ve element verilerini indeksle."""
         logger.info("BDF dosyasi okunuyor: %s", self.bdf_path)
         self.model = BDF(debug=False)
-        self.model.read_bdf(self.bdf_path, xref=True)
+
+        # BDF dosyalari genellikle Latin-1 encoding ile yazilir.
+        for enc in ("utf-8", "latin-1", "cp1252"):
+            try:
+                self.model.read_bdf(self.bdf_path, xref=True, encoding=enc)
+                logger.info("BDF encoding: %s", enc)
+                break
+            except UnicodeDecodeError:
+                logger.warning("Encoding %s basarisiz, sonraki deneniyor...", enc)
+                self.model = BDF(debug=False)
+        else:
+            self.model = BDF(debug=False)
+            self.model.read_bdf(self.bdf_path, xref=True, encoding="utf-8")
         logger.info(
             "BDF okundu: %d element, %d node",
             len(self.model.elements),
