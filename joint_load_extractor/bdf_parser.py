@@ -6,6 +6,9 @@ bağlı olan CQUAD4/CTRIA3 elementlerini tespit eder.
 """
 
 import logging
+import os
+import shutil
+import tempfile
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Set, Tuple
@@ -56,20 +59,29 @@ class BDFParser:
     def parse(self) -> None:
         """BDF dosyasını oku ve element verilerini indeksle."""
         logger.info("BDF dosyasi okunuyor: %s", self.bdf_path)
-        self.model = BDF(debug=False)
 
-        # BDF dosyalari genellikle Latin-1 encoding ile yazilir.
-        for enc in ("utf-8", "latin-1", "cp1252"):
-            try:
-                self.model.read_bdf(self.bdf_path, xref=True, encoding=enc)
-                logger.info("BDF encoding: %s", enc)
-                break
-            except UnicodeDecodeError:
-                logger.warning("Encoding %s basarisiz, sonraki deneniyor...", enc)
-                self.model = BDF(debug=False)
-        else:
+        bdf_to_read = self.bdf_path
+        tmp_path = None
+
+        # Dosya UTF-8 degilse, latin-1 ile okuyup UTF-8 gecici dosyaya yaz
+        try:
+            with open(self.bdf_path, "r", encoding="utf-8") as f:
+                f.read()
+        except UnicodeDecodeError:
+            logger.warning("BDF dosyasi UTF-8 degil, latin-1 olarak yeniden kodlaniyor...")
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix=".bdf")
+            os.close(tmp_fd)
+            with open(self.bdf_path, "r", encoding="latin-1") as src:
+                with open(tmp_path, "w", encoding="utf-8") as dst:
+                    shutil.copyfileobj(src, dst)
+            bdf_to_read = tmp_path
+
+        try:
             self.model = BDF(debug=False)
-            self.model.read_bdf(self.bdf_path, xref=True, encoding="utf-8")
+            self.model.read_bdf(bdf_to_read, xref=True, encoding="utf-8")
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
         logger.info(
             "BDF okundu: %d element, %d node",
             len(self.model.elements),
