@@ -250,15 +250,18 @@ class BDFParser:
                 eid=eid, pid=pid, node_a=node_a, node_b=node_b,
             )
 
-            connected_quad_eids = set()
-            for nid in [node_a, node_b]:
-                connected_quad_eids.update(self._node_to_quads.get(nid, set()))
+            # Bar'in HER IKI node'una da bagli olanlar (intersection)
+            quads_at_a = self._node_to_quads.get(node_a, set())
+            quads_at_b = self._node_to_quads.get(node_b, set())
+            connected_quad_eids = quads_at_a & quads_at_b
+
             for qeid in sorted(connected_quad_eids):
                 bar_info.connected_quads[qeid] = self._element_nodes[qeid]
 
-            connected_tria_eids = set()
-            for nid in [node_a, node_b]:
-                connected_tria_eids.update(self._node_to_trias.get(nid, set()))
+            trias_at_a = self._node_to_trias.get(node_a, set())
+            trias_at_b = self._node_to_trias.get(node_b, set())
+            connected_tria_eids = trias_at_a & trias_at_b
+
             for teid in sorted(connected_tria_eids):
                 bar_info.connected_trias[teid] = self._element_nodes[teid]
 
@@ -788,9 +791,10 @@ class RegressionEquation:
 
 @dataclass
 class JointCorrelationResult:
-    """Bir bar element icin tum korelasyon sonuclari."""
+    """Bir bar element + element type icin tum korelasyon sonuclari."""
     bar_eid: int
     subcase_id: int
+    element_type: int  # H5 Element Type (0, 1, ...)
     n_connected_shells: int
     equations: List[RegressionEquation] = field(default_factory=list)
     predictor_data: Dict[str, np.ndarray] = field(default_factory=dict)
@@ -813,6 +817,7 @@ class CorrelationEngine:
         self,
         bar_eid: int,
         subcase_id: int,
+        element_type: int,
         bar_axial: np.ndarray,
         avg_shell_nx: np.ndarray,
         avg_shell_ny: np.ndarray,
@@ -823,7 +828,8 @@ class CorrelationEngine:
         """Coklu regresyon: Target = a1*Axial + a2*Nx + a3*Ny + a4*Nxy + b"""
         logger = logging.getLogger(__name__)
         result = JointCorrelationResult(
-            bar_eid=bar_eid, subcase_id=subcase_id, n_connected_shells=n_shells,
+            bar_eid=bar_eid, subcase_id=subcase_id,
+            element_type=element_type, n_connected_shells=n_shells,
         )
 
         predictors = {
@@ -900,6 +906,7 @@ class CorrelationEngine:
                 row = {
                     "Bar_EID": res.bar_eid,
                     "Subcase_ID": res.subcase_id,
+                    "Element_Type": res.element_type,
                     "N_Shells": res.n_connected_shells,
                     "Target": eq.target_name,
                     "R_Squared": eq.r_squared,
@@ -1129,10 +1136,10 @@ class ReportGenerator:
                 row += 2
 
             for res in results:
-                ws.write(row, 0, f"Subcase {res.subcase_id} | {res.n_connected_shells} shell", header_fmt)
+                ws.write(row, 0, f"SC {res.subcase_id} ET {res.element_type}", header_fmt)
                 ws.merge_range(
                     row, 0, row, 6,
-                    f"Multiple Regression (SC {res.subcase_id}, {res.n_connected_shells} shells)",
+                    f"Multiple Regression (SC {res.subcase_id}, Element Type {res.element_type}, {res.n_connected_shells} shells)",
                     header_fmt,
                 )
                 row += 1
@@ -1268,6 +1275,14 @@ def build_shell_forces_dataframe(
     return pd.DataFrame(rows)
 
 
+def _find_element_type_col(df: pd.DataFrame) -> str:
+    """H5 DataFrame'inde Element Type kolonunu bul."""
+    for col in df.columns:
+        if col.lower().replace(" ", "").replace("_", "") == "elementtype":
+            return col
+    return None
+
+
 def run_correlation_analysis(
     connectivity: Dict[int, BarElementInfo],
     bar_forces: Dict[Tuple[int, int], BarForceResult],
@@ -1277,7 +1292,7 @@ def run_correlation_analysis(
 ) -> Tuple[CorrelationEngine, List[JointCorrelationResult]]:
     """Korelasyon analizini calistir.
 
-    Her bar element icin coklu regresyon denklemi:
+    Her bar element + element type icin ayri coklu regresyon denklemi:
       Target = a1*Bar_Axial + a2*Avg_Nx + a3*Avg_Ny + a4*Avg_Nxy + b
     """
     logger = logging.getLogger(__name__)
@@ -1296,6 +1311,13 @@ def run_correlation_analysis(
         if not sc_keys:
             logger.warning("Bar %d icin OP2 kuvvet verisi yok", bar_eid)
             continue
+
+        # Element Type kolonunu bul ve grupla
+        et_col = _find_element_type_col(h5_data)
+        if et_col is not None:
+            element_types = sorted(h5_data[et_col].unique())
+        else:
+            element_types = [0]
 
         for sc_id_key, _ in sc_keys:
             if subcase_id is not None and sc_id_key != subcase_id:
@@ -1322,17 +1344,29 @@ def run_correlation_analysis(
             avg_ny = np.mean(all_ny, axis=0)
             avg_nxy = np.mean(all_nxy, axis=0)
 
-            result = engine.compute_joint_correlation(
-                bar_eid=bar_eid,
-                subcase_id=sc_id_key,
-                bar_axial=bar_result.axial_force,
-                avg_shell_nx=avg_nx,
-                avg_shell_ny=avg_ny,
-                avg_shell_nxy=avg_nxy,
-                h5_data=h5_data,
-                n_shells=len(all_nx),
-            )
-            all_results.append(result)
+            # Her Element Type icin ayri regresyon
+            for et in element_types:
+                if et_col is not None:
+                    h5_subset = h5_data[h5_data[et_col] == et].copy()
+                else:
+                    h5_subset = h5_data
+
+                if h5_subset.empty:
+                    continue
+
+                logger.info("  Bar %d, SC %d, ElementType %s", bar_eid, sc_id_key, et)
+                result = engine.compute_joint_correlation(
+                    bar_eid=bar_eid,
+                    subcase_id=sc_id_key,
+                    element_type=int(et),
+                    bar_axial=bar_result.axial_force,
+                    avg_shell_nx=avg_nx,
+                    avg_shell_ny=avg_ny,
+                    avg_shell_nxy=avg_nxy,
+                    h5_data=h5_subset,
+                    n_shells=len(all_nx),
+                )
+                all_results.append(result)
 
     return engine, all_results
 

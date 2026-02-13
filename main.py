@@ -145,6 +145,14 @@ def build_shell_forces_dataframe(
     return pd.DataFrame(rows)
 
 
+def _find_element_type_col(df: pd.DataFrame) -> str:
+    """H5 DataFrame'inde Element Type kolonunu bul."""
+    for col in df.columns:
+        if col.lower().replace(" ", "").replace("_", "") == "elementtype":
+            return col
+    return None
+
+
 def run_correlation_analysis(
     connectivity: Dict[int, BarElementInfo],
     bar_forces: Dict[Tuple[int, int], BarForceResult],
@@ -155,11 +163,8 @@ def run_correlation_analysis(
     """
     Korelasyon analizini calistir.
 
-    Her bar element icin coklu regresyon denklemi:
+    Her bar element + element type icin ayri coklu regresyon denklemi:
       Target = a1*Bar_Axial + a2*Avg_Nx + a3*Avg_Ny + a4*Avg_Nxy + b
-
-    Predictors (OP2):  Bar Axial + Avg Shell Nx/Ny/Nxy
-    Targets (H5):      F Bearing X/Y, NX/NY/NXY Bypass
     """
     logger = logging.getLogger(__name__)
     engine = CorrelationEngine()
@@ -177,6 +182,13 @@ def run_correlation_analysis(
         if not sc_keys:
             logger.warning("Bar %d icin OP2 kuvvet verisi yok", bar_eid)
             continue
+
+        # Element Type kolonunu bul ve grupla
+        et_col = _find_element_type_col(h5_data)
+        if et_col is not None:
+            element_types = sorted(h5_data[et_col].unique())
+        else:
+            element_types = [0]  # Element Type kolonu yoksa tek grup
 
         for sc_id_key, _ in sc_keys:
             if subcase_id is not None and sc_id_key != subcase_id:
@@ -203,17 +215,29 @@ def run_correlation_analysis(
             avg_ny = np.mean(all_ny, axis=0)
             avg_nxy = np.mean(all_nxy, axis=0)
 
-            result = engine.compute_joint_correlation(
-                bar_eid=bar_eid,
-                subcase_id=sc_id_key,
-                bar_axial=bar_result.axial_force,
-                avg_shell_nx=avg_nx,
-                avg_shell_ny=avg_ny,
-                avg_shell_nxy=avg_nxy,
-                h5_data=h5_data,
-                n_shells=len(all_nx),
-            )
-            all_results.append(result)
+            # Her Element Type icin ayri regresyon
+            for et in element_types:
+                if et_col is not None:
+                    h5_subset = h5_data[h5_data[et_col] == et].copy()
+                else:
+                    h5_subset = h5_data
+
+                if h5_subset.empty:
+                    continue
+
+                logger.info("  Bar %d, SC %d, ElementType %s", bar_eid, sc_id_key, et)
+                result = engine.compute_joint_correlation(
+                    bar_eid=bar_eid,
+                    subcase_id=sc_id_key,
+                    element_type=int(et),
+                    bar_axial=bar_result.axial_force,
+                    avg_shell_nx=avg_nx,
+                    avg_shell_ny=avg_ny,
+                    avg_shell_nxy=avg_nxy,
+                    h5_data=h5_subset,
+                    n_shells=len(all_nx),
+                )
+                all_results.append(result)
 
     return engine, all_results
 

@@ -280,10 +280,10 @@ class ReportGenerator:
 
             # --- Regresyon Denklemleri ---
             for res in results:
-                ws.write(row, 0, f"Subcase {res.subcase_id} | {res.n_connected_shells} shell", header_fmt)
+                ws.write(row, 0, f"SC {res.subcase_id} ET {res.element_type}", header_fmt)
                 ws.merge_range(
                     row, 0, row, 6,
-                    f"Multiple Regression (SC {res.subcase_id}, {res.n_connected_shells} shells)",
+                    f"Multiple Regression (SC {res.subcase_id}, Element Type {res.element_type}, {res.n_connected_shells} shells)",
                     header_fmt,
                 )
                 row += 1

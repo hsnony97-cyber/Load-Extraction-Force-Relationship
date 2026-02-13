@@ -247,18 +247,18 @@ class BDFParser:
                 node_b=node_b,
             )
 
-            # Bar node'larına bağlı QUAD elementlerini bul
-            connected_quad_eids = set()
-            for nid in [node_a, node_b]:
-                connected_quad_eids.update(self._node_to_quads.get(nid, set()))
+            # Bar'in HER IKI node'una da bagli QUAD elementlerini bul (intersection)
+            quads_at_a = self._node_to_quads.get(node_a, set())
+            quads_at_b = self._node_to_quads.get(node_b, set())
+            connected_quad_eids = quads_at_a & quads_at_b  # her iki node'a da bagli
 
             for qeid in sorted(connected_quad_eids):
                 bar_info.connected_quads[qeid] = self._element_nodes[qeid]
 
-            # Bar node'larına bağlı TRIA elementlerini bul
-            connected_tria_eids = set()
-            for nid in [node_a, node_b]:
-                connected_tria_eids.update(self._node_to_trias.get(nid, set()))
+            # Bar'in HER IKI node'una da bagli TRIA elementlerini bul (intersection)
+            trias_at_a = self._node_to_trias.get(node_a, set())
+            trias_at_b = self._node_to_trias.get(node_b, set())
+            connected_tria_eids = trias_at_a & trias_at_b  # her iki node'a da bagli
 
             for teid in sorted(connected_tria_eids):
                 bar_info.connected_trias[teid] = self._element_nodes[teid]

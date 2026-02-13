@@ -56,9 +56,10 @@ class RegressionEquation:
 
 @dataclass
 class JointCorrelationResult:
-    """Bir bar element icin tum korelasyon sonuclari."""
+    """Bir bar element + element type icin tum korelasyon sonuclari."""
     bar_eid: int
     subcase_id: int
+    element_type: int  # H5'teki Element Type (0, 1, ...)
     n_connected_shells: int
     equations: List[RegressionEquation] = field(default_factory=list)
     predictor_data: Dict[str, np.ndarray] = field(default_factory=dict)
@@ -80,6 +81,7 @@ class CorrelationEngine:
         self,
         bar_eid: int,
         subcase_id: int,
+        element_type: int,
         bar_axial: np.ndarray,
         avg_shell_nx: np.ndarray,
         avg_shell_ny: np.ndarray,
@@ -97,18 +99,21 @@ class CorrelationEngine:
             Bar element ID.
         subcase_id : int
             Subcase ID.
+        element_type : int
+            H5 Element Type (0, 1, ...).
         bar_axial : np.ndarray
             Bar axial force (ntimes,).
         avg_shell_nx, avg_shell_ny, avg_shell_nxy : np.ndarray
             Bagli tum shell'lerin ortalama Nx, Ny, Nxy (ntimes,).
         h5_data : pd.DataFrame
-            H5 Joint Load Cap verileri.
+            H5 Joint Load Cap verileri (bu element type icin filtrelenmis).
         n_shells : int
             Bagli shell sayisi.
         """
         result = JointCorrelationResult(
             bar_eid=bar_eid,
             subcase_id=subcase_id,
+            element_type=element_type,
             n_connected_shells=n_shells,
         )
 
@@ -207,6 +212,7 @@ class CorrelationEngine:
                 row = {
                     "Bar_EID": res.bar_eid,
                     "Subcase_ID": res.subcase_id,
+                    "Element_Type": res.element_type,
                     "N_Shells": res.n_connected_shells,
                     "Target": eq.target_name,
                     "R_Squared": eq.r_squared,
