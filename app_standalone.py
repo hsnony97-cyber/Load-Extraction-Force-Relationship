@@ -337,12 +337,28 @@ class OP2Reader:
         logger.info("OP2 dosyasi okunuyor: %s", self.op2_path)
         self.op2 = OP2(debug=False)
         self.op2.read_op2(self.op2_path)
-        self._available_subcases = list(self.op2.subcases.keys())
+        self._available_subcases = self._collect_subcase_ids()
         logger.info("OP2 okundu. Subcases: %s", self._available_subcases)
 
     @property
     def subcases(self) -> List[int]:
         return self._available_subcases
+
+    def _collect_subcase_ids(self) -> List[int]:
+        """OP2 sonuc tablolarindan mevcut subcase ID'lerini topla."""
+        sc_ids: set = set()
+        for attr in (
+            "cbar_force", "cbeam_force",
+            "cquad4_force", "ctria3_force",
+            "cquad8_force", "ctria6_force",
+            "cshear_force",
+        ):
+            result_dict = getattr(self.op2, attr, None)
+            if result_dict:
+                sc_ids.update(result_dict.keys())
+        if hasattr(self.op2, "subcases") and self.op2.subcases:
+            sc_ids.update(self.op2.subcases.keys())
+        return sorted(sc_ids)
 
     def get_bar_forces(
         self,
@@ -519,11 +535,14 @@ class OP2Reader:
 
     def get_load_case_info(self) -> pd.DataFrame:
         rows = []
-        for sc_id, subcase in self.op2.subcases.items():
-            rows.append({
-                "Subcase_ID": sc_id,
-                "Label": str(subcase.get("SUBTITLE", [""])[0]) if isinstance(subcase, dict) else str(sc_id),
-            })
+        subcases_dict = getattr(self.op2, "subcases", None) or {}
+        for sc_id in self._available_subcases:
+            label = str(sc_id)
+            if sc_id in subcases_dict:
+                sub = subcases_dict[sc_id]
+                if isinstance(sub, dict):
+                    label = str(sub.get("SUBTITLE", [""])[0])
+            rows.append({"Subcase_ID": sc_id, "Label": label})
         return pd.DataFrame(rows)
 
     @staticmethod
