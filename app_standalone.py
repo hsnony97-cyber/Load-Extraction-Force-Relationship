@@ -1283,6 +1283,15 @@ def _find_element_type_col(df: pd.DataFrame) -> str:
     return None
 
 
+def _find_subcase_col(df: pd.DataFrame) -> str:
+    """H5 DataFrame'inde Subcase ID kolonunu bul."""
+    for col in df.columns:
+        normalized = col.lower().replace(" ", "").replace("_", "")
+        if normalized in ("subcaseid", "subcase"):
+            return col
+    return None
+
+
 def run_correlation_analysis(
     connectivity: Dict[int, BarElementInfo],
     bar_forces: Dict[Tuple[int, int], BarForceResult],
@@ -1292,7 +1301,8 @@ def run_correlation_analysis(
 ) -> Tuple[CorrelationEngine, List[JointCorrelationResult]]:
     """Korelasyon analizini calistir.
 
-    Her bar element + element type icin ayri coklu regresyon denklemi:
+    Her bar element + element type icin TUM SUBCASE'LER uzerinden
+    veri toplayarak coklu regresyon denklemi olusturur:
       Target = a1*Bar_Axial + a2*Avg_Nx + a3*Avg_Ny + a4*Avg_Nxy + b
     """
     logger = logging.getLogger(__name__)
@@ -1312,12 +1322,14 @@ def run_correlation_analysis(
             logger.warning("Bar %d icin OP2 kuvvet verisi yok", bar_eid)
             continue
 
-        # Element Type kolonunu bul ve grupla
-        et_col = _find_element_type_col(h5_data)
-        if et_col is not None:
-            element_types = sorted(h5_data[et_col].unique())
-        else:
-            element_types = [0]
+        shell_eids = list(info.connected_quads.keys()) + list(info.connected_trias.keys())
+
+        # OP2 verilerini TUM subcase'ler uzerinden topla
+        collected_sc_ids = []
+        collected_axial = []
+        collected_avg_nx = []
+        collected_avg_ny = []
+        collected_avg_nxy = []
 
         for sc_id_key, _ in sc_keys:
             if subcase_id is not None and sc_id_key != subcase_id:
@@ -1327,46 +1339,68 @@ def run_correlation_analysis(
             if bar_result is None:
                 continue
 
-            # Bagli tum shell'lerin Nx, Ny, Nxy ortalamasi
-            all_nx, all_ny, all_nxy = [], [], []
-            for seid in list(info.connected_quads.keys()) + list(info.connected_trias.keys()):
+            shell_nx, shell_ny, shell_nxy = [], [], []
+            for seid in shell_eids:
                 sf = shell_forces.get((sc_id_key, seid))
                 if sf is not None:
-                    all_nx.append(sf.membrane_x)
-                    all_ny.append(sf.membrane_y)
-                    all_nxy.append(sf.membrane_xy)
+                    shell_nx.append(sf.membrane_x)
+                    shell_ny.append(sf.membrane_y)
+                    shell_nxy.append(sf.membrane_xy)
 
-            if not all_nx:
-                logger.warning("Bar %d (SC %d): Bagli shell kuvveti yok", bar_eid, sc_id_key)
+            if not shell_nx:
                 continue
 
-            avg_nx = np.mean(all_nx, axis=0)
-            avg_ny = np.mean(all_ny, axis=0)
-            avg_nxy = np.mean(all_nxy, axis=0)
+            axial_mean = np.mean(bar_result.axial_force)
+            avg_nx_mean = np.mean(np.mean(shell_nx, axis=0))
+            avg_ny_mean = np.mean(np.mean(shell_ny, axis=0))
+            avg_nxy_mean = np.mean(np.mean(shell_nxy, axis=0))
 
-            # Her Element Type icin ayri regresyon
-            for et in element_types:
-                if et_col is not None:
-                    h5_subset = h5_data[h5_data[et_col] == et].copy()
-                else:
-                    h5_subset = h5_data
+            collected_sc_ids.append(sc_id_key)
+            collected_axial.append(axial_mean)
+            collected_avg_nx.append(avg_nx_mean)
+            collected_avg_ny.append(avg_ny_mean)
+            collected_avg_nxy.append(avg_nxy_mean)
 
-                if h5_subset.empty:
-                    continue
+        if not collected_sc_ids:
+            logger.warning("Bar %d: Hicbir subcase icin veri toplanamadi", bar_eid)
+            continue
 
-                logger.info("  Bar %d, SC %d, ElementType %s", bar_eid, sc_id_key, et)
-                result = engine.compute_joint_correlation(
-                    bar_eid=bar_eid,
-                    subcase_id=sc_id_key,
-                    element_type=int(et),
-                    bar_axial=bar_result.axial_force,
-                    avg_shell_nx=avg_nx,
-                    avg_shell_ny=avg_ny,
-                    avg_shell_nxy=avg_nxy,
-                    h5_data=h5_subset,
-                    n_shells=len(all_nx),
-                )
-                all_results.append(result)
+        n_shells = len([s for s in shell_eids
+                        if shell_forces.get((collected_sc_ids[0], s)) is not None])
+
+        logger.info("  Bar %d: %d subcase, %d shell uzerinden veri toplandi",
+                     bar_eid, len(collected_sc_ids), n_shells)
+
+        et_col = _find_element_type_col(h5_data)
+        if et_col is not None:
+            element_types = sorted(h5_data[et_col].unique())
+        else:
+            element_types = [0]
+
+        for et in element_types:
+            if et_col is not None:
+                h5_subset = h5_data[h5_data[et_col] == et].copy()
+            else:
+                h5_subset = h5_data
+
+            if h5_subset.empty:
+                continue
+
+            logger.info("  Bar %d, ElementType %s, %d H5 satir, %d OP2 subcase",
+                        bar_eid, et, len(h5_subset), len(collected_sc_ids))
+
+            result = engine.compute_joint_correlation(
+                bar_eid=bar_eid,
+                subcase_id=0,
+                element_type=int(et),
+                bar_axial=np.array(collected_axial),
+                avg_shell_nx=np.array(collected_avg_nx),
+                avg_shell_ny=np.array(collected_avg_ny),
+                avg_shell_nxy=np.array(collected_avg_nxy),
+                h5_data=h5_subset,
+                n_shells=n_shells,
+            )
+            all_results.append(result)
 
     return engine, all_results
 
