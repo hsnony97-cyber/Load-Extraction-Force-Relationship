@@ -84,20 +84,56 @@ class BDFParser:
         bdf_to_read = self.bdf_path
         tmp_path = None
 
-        # Dosya UTF-8 degilse, latin-1 ile okuyup UTF-8 gecici dosyaya yaz
         try:
-            with open(self.bdf_path, "r", encoding="utf-8") as f:
-                f.read()
-        except UnicodeDecodeError:
-            logger.warning("BDF dosyasi UTF-8 degil, latin-1 olarak yeniden kodlaniyor...")
+            # --- 1. Encoding duzeltmesi ---
+            try:
+                with open(self.bdf_path, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+            except UnicodeDecodeError:
+                logger.warning("BDF dosyasi UTF-8 degil, latin-1 olarak yeniden kodlaniyor...")
+                with open(self.bdf_path, "r", encoding="latin-1") as f:
+                    lines = f.readlines()
+
+            # --- 2. Erisilemez INCLUDE satirlarini kaldir ---
+            bdf_dir = os.path.dirname(os.path.abspath(self.bdf_path))
+            cleaned_lines = []
+            skipped = 0
+            for line in lines:
+                stripped = line.strip().upper()
+                if stripped.startswith("INCLUDE"):
+                    # INCLUDE 'dosya' veya INCLUDE "dosya" formatini parse et
+                    raw = line.strip()
+                    inc_file = None
+                    for q in ("'", '"'):
+                        start = raw.find(q)
+                        if start != -1:
+                            end = raw.find(q, start + 1)
+                            if end != -1:
+                                inc_file = raw[start + 1:end]
+                                break
+                    if inc_file is not None:
+                        # Mutlak veya BDF dizinine goreceli yol kontrolu
+                        if not os.path.isabs(inc_file):
+                            inc_file_full = os.path.join(bdf_dir, inc_file)
+                        else:
+                            inc_file_full = inc_file
+                        if not os.path.exists(inc_file_full):
+                            logger.warning("INCLUDE dosyasi bulunamadi, atlaniyor: %s", inc_file)
+                            cleaned_lines.append("$ SKIPPED: " + line)
+                            skipped += 1
+                            continue
+                cleaned_lines.append(line)
+
+            if skipped > 0:
+                logger.info("%d erisilemez INCLUDE atlandi", skipped)
+
+            # Gecici dosyaya yaz (encoding + include temizligi)
             tmp_fd, tmp_path = tempfile.mkstemp(suffix=".bdf")
             os.close(tmp_fd)
-            with open(self.bdf_path, "r", encoding="latin-1") as src:
-                with open(tmp_path, "w", encoding="utf-8") as dst:
-                    shutil.copyfileobj(src, dst)
+            with open(tmp_path, "w", encoding="utf-8") as dst:
+                dst.writelines(cleaned_lines)
             bdf_to_read = tmp_path
 
-        try:
             self.model = BDF(debug=False)
             self.model.read_bdf(bdf_to_read, xref=True, encoding="utf-8")
         finally:
