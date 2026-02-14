@@ -283,6 +283,7 @@ def run_correlation_analysis(
                 matched_ny = []
                 matched_nxy = []
                 matched_h5_indices = []
+                matched_sc_ids = []
 
                 for idx, row in h5_subset.iterrows():
                     h5_sc = int(row[sc_col])
@@ -293,6 +294,7 @@ def run_correlation_analysis(
                         matched_ny.append(ny)
                         matched_nxy.append(nxy)
                         matched_h5_indices.append(idx)
+                        matched_sc_ids.append(h5_sc)
 
                 n_matched = len(matched_h5_indices)
                 n_h5_total = len(h5_subset)
@@ -331,6 +333,7 @@ def run_correlation_analysis(
                 pred_nx = np.array(collected_avg_nx)
                 pred_ny = np.array(collected_avg_ny)
                 pred_nxy = np.array(collected_avg_nxy)
+                matched_sc_ids = list(collected_sc_ids)
 
             logger.info("  Bar %d, ElementType %s, %d eslesen veri noktasi",
                         bar_eid, et, len(pred_axial))
@@ -346,6 +349,7 @@ def run_correlation_analysis(
                 h5_data=h5_matched,
                 n_shells=n_shells,
             )
+            result.matched_subcases = matched_sc_ids
             all_results.append(result)
 
     return engine, all_results

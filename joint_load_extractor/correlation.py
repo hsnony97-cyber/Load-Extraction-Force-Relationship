@@ -64,6 +64,7 @@ class JointCorrelationResult:
     equations: List[RegressionEquation] = field(default_factory=list)
     predictor_data: Dict[str, np.ndarray] = field(default_factory=dict)
     target_data: Dict[str, np.ndarray] = field(default_factory=dict)
+    matched_subcases: List[int] = field(default_factory=list)
 
 
 class CorrelationEngine:

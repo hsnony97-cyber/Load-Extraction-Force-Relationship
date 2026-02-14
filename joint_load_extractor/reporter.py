@@ -120,7 +120,13 @@ class ReportGenerator:
                     header_fmt, number_fmt, int_fmt,
                 )
 
-            # 7. Per-bar detail sheets
+            # 7. Predicted vs Actual
+            self._write_predicted_vs_actual(
+                writer, workbook, correlation_results,
+                header_fmt, number_fmt, int_fmt, border_fmt,
+            )
+
+            # 8. Per-bar detail sheets
             self._write_per_bar_details(
                 writer, workbook, connectivity, correlation_results,
                 header_fmt, number_fmt, int_fmt, bar_fmt, quad_fmt, tria_fmt, border_fmt,
@@ -229,6 +235,95 @@ class ReportGenerator:
             # Kolon genişliği
             max_len = max(len(str(col_name)), df[col_name].astype(str).str.len().max())
             ws.set_column(col_idx, col_idx, min(max_len + 2, 25))
+
+    def _write_predicted_vs_actual(
+        self, writer, workbook, correlation_results,
+        header_fmt, number_fmt, int_fmt, border_fmt,
+    ):
+        """Predicted vs Actual sheet'i - her subcase icin tahmin ve hata orani."""
+        rows = []
+
+        for res in correlation_results:
+            if not res.equations or not res.predictor_data:
+                continue
+
+            pred_names = list(res.predictor_data.keys())
+            n = min(len(v) for v in res.predictor_data.values())
+            if n == 0:
+                continue
+
+            X = np.column_stack([res.predictor_data[k][:n] for k in pred_names])
+            subcases = res.matched_subcases[:n] if res.matched_subcases else [0] * n
+
+            for eq in res.equations:
+                actual_arr = res.target_data.get(eq.target_name)
+                if actual_arr is None:
+                    continue
+                actual_arr = actual_arr[:n]
+
+                predicted_arr = X @ eq.coefficients + eq.intercept
+
+                for i in range(n):
+                    actual_val = float(actual_arr[i])
+                    pred_val = float(predicted_arr[i])
+
+                    if abs(actual_val) > 1e-10:
+                        error_pct = (pred_val - actual_val) / actual_val * 100.0
+                    else:
+                        error_pct = 0.0
+
+                    row = {
+                        "Bar_EID": res.bar_eid,
+                        "Element_Type": res.element_type,
+                        "Subcase_ID": subcases[i] if i < len(subcases) else 0,
+                        "Target": eq.target_name,
+                        "Bar_Axial": float(X[i, 0]) if X.shape[1] > 0 else 0,
+                        "Shell_Nx": float(X[i, 1]) if X.shape[1] > 1 else 0,
+                        "Shell_Ny": float(X[i, 2]) if X.shape[1] > 2 else 0,
+                        "Shell_Nxy": float(X[i, 3]) if X.shape[1] > 3 else 0,
+                        "Actual": actual_val,
+                        "Predicted": pred_val,
+                        "Error_%": error_pct,
+                    }
+                    rows.append(row)
+
+        if not rows:
+            logger.info("Predicted vs Actual: veri yok, sheet atlanıyor")
+            return
+
+        df = pd.DataFrame(rows)
+        sheet_name = "Predicted vs Actual"
+        df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=1)
+        ws = writer.sheets[sheet_name]
+
+        for col_idx, col_name in enumerate(df.columns):
+            ws.write(0, col_idx, col_name, header_fmt)
+
+        # Kolon genislikleri
+        ws.set_column(0, 0, 10)   # Bar_EID
+        ws.set_column(1, 1, 12)   # Element_Type
+        ws.set_column(2, 2, 10)   # Subcase_ID
+        ws.set_column(3, 3, 14)   # Target
+        ws.set_column(4, 7, 14)   # predictor degerleri
+        ws.set_column(8, 9, 16)   # Actual, Predicted
+        ws.set_column(10, 10, 10) # Error_%
+
+        # Error % renklendirme: iyi (<10%) yesil, kotu (>25%) kirmizi
+        good_err_fmt = workbook.add_format({
+            "num_format": "0.00", "border": 1, "bg_color": self.CORR_POS_COLOR,
+        })
+        bad_err_fmt = workbook.add_format({
+            "num_format": "0.00", "border": 1, "bg_color": self.CORR_NEG_COLOR,
+        })
+        err_col_idx = list(df.columns).index("Error_%")
+        for row_idx, row_data in enumerate(rows):
+            err_val = abs(row_data["Error_%"])
+            if err_val <= 10:
+                ws.write(row_idx + 1, err_col_idx, row_data["Error_%"], good_err_fmt)
+            elif err_val > 25:
+                ws.write(row_idx + 1, err_col_idx, row_data["Error_%"], bad_err_fmt)
+
+        logger.info("Predicted vs Actual: %d satir yazildi", len(rows))
 
     def _write_per_bar_details(
         self, writer, workbook, connectivity, correlation_results,
