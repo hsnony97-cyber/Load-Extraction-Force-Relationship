@@ -841,6 +841,8 @@ class JointCorrelationResult:
     subcase_id: int
     element_type: int  # H5 Element Type (0, 1, ...)
     n_connected_shells: int
+    shell_eid: Optional[int] = None       # Per-shell analiz icin shell element ID
+    shell_type: Optional[str] = None      # Per-shell analiz icin shell tipi (CQUAD4, CTRIA3, ...)
     equations: List[RegressionEquation] = field(default_factory=list)
     predictor_data: Dict[str, np.ndarray] = field(default_factory=dict)
     target_data: Dict[str, np.ndarray] = field(default_factory=dict)
@@ -999,6 +1001,7 @@ class ReportGenerator:
         h5_joint_loads: pd.DataFrame,
         correlation_results: List[CorrelationResult],
         correlation_summary_df: pd.DataFrame,
+        per_shell_results: Optional[List[JointCorrelationResult]] = None,
     ) -> str:
         logger = logging.getLogger(__name__)
         logger.info("Excel raporu olusturuluyor: %s", self.output_path)
@@ -1059,9 +1062,10 @@ class ReportGenerator:
                 header_fmt, number_fmt, int_fmt, border_fmt,
             )
 
-            # Total Summary - tum bar elementler icin tek tablo
+            # Total Summary - tum bar elementler icin tek tablo (per-shell)
             self._write_total_summary(
-                writer, workbook, connectivity, correlation_results,
+                writer, workbook, connectivity,
+                per_shell_results if per_shell_results else correlation_results,
                 header_fmt, number_fmt, int_fmt, border_fmt,
             )
 
@@ -1151,9 +1155,10 @@ class ReportGenerator:
         header_fmt, number_fmt, int_fmt, border_fmt,
     ):
         """
-        Total Summary sheet'i - tum bar elementler icin tek tablo.
+        Total Summary sheet'i - per-shell bazinda tum bar elementler icin tek tablo.
 
-        Her satir bir (Bar_EID, Element_Type) kombinasyonu.
+        Per-shell sonuclari varsa (shell_eid != None), her satir bir
+        (Bar_EID, Shell_EID, Shell_Type, Element_Type) kombinasyonu.
         """
         logger = logging.getLogger(__name__)
         target_short = {
@@ -1168,6 +1173,8 @@ class ReportGenerator:
         for res in correlation_results:
             row = {
                 "Bar_EID": res.bar_eid,
+                "Shell_EID": res.shell_eid if res.shell_eid is not None else "",
+                "Shell_Type": res.shell_type if res.shell_type is not None else "",
                 "Element_Type": res.element_type,
                 "N_Shells": res.n_connected_shells,
                 "N_Subcases": len(res.matched_subcases) if res.matched_subcases else 0,
@@ -1177,13 +1184,9 @@ class ReportGenerator:
             if info:
                 row["Node_A"] = info.node_a
                 row["Node_B"] = info.node_b
-                row["Connected_QUADs"] = len(info.connected_quads)
-                row["Connected_TRIAs"] = len(info.connected_trias)
             else:
                 row["Node_A"] = ""
                 row["Node_B"] = ""
-                row["Connected_QUADs"] = 0
-                row["Connected_TRIAs"] = 0
 
             eq_map = {eq.target_name: eq for eq in res.equations}
             for target_name, short in target_short.items():
@@ -1217,11 +1220,12 @@ class ReportGenerator:
         for col_idx, col_name in enumerate(df.columns):
             ws.write(0, col_idx, col_name, header_fmt)
 
-        ws.set_column(0, 0, 10)
-        ws.set_column(1, 1, 12)
-        ws.set_column(2, 3, 10)
-        ws.set_column(4, 5, 10)
-        ws.set_column(6, 7, 14)
+        ws.set_column(0, 0, 12)   # Bar_EID
+        ws.set_column(1, 1, 12)   # Shell_EID
+        ws.set_column(2, 2, 10)   # Shell_Type
+        ws.set_column(3, 3, 12)   # Element_Type
+        ws.set_column(4, 5, 10)   # N_Shells, N_Subcases
+        ws.set_column(6, 7, 10)   # Node_A, Node_B
         ws.set_column(8, len(df.columns) - 1, 18)
 
         good_r2_fmt = workbook.add_format({
@@ -1240,9 +1244,9 @@ class ReportGenerator:
                     fmt = good_r2_fmt if val >= 0.7 else bad_r2_fmt
                     ws.write(row_idx + 1, col_idx, val, fmt)
 
-        ws.freeze_panes(1, 2)
+        ws.freeze_panes(1, 3)
 
-        logger.info("Total Summary: %d satir yazildi", len(rows))
+        logger.info("Total Summary: %d satir yazildi (per-shell)", len(rows))
 
     def _write_predicted_vs_actual(
         self, writer, workbook, correlation_results,
@@ -1720,6 +1724,153 @@ def run_correlation_analysis(
     return engine, all_results
 
 
+def run_per_shell_correlation_analysis(
+    connectivity: Dict[int, BarElementInfo],
+    bar_forces: Dict[Tuple[int, int], BarForceResult],
+    shell_forces: Dict[Tuple[int, int], ShellForceResult],
+    h5_reader: H5Reader,
+    subcase_id: int = None,
+) -> List[JointCorrelationResult]:
+    """
+    Her bagli shell element icin AYRI AYRI korelasyon analizi calistir.
+
+    Ortalama almak yerine, her shell element icin bireysel regresyon:
+      Target = a1*Bar_Axial + a2*Shell_Nx + a3*Shell_Ny + a4*Shell_Nxy + b
+    """
+    logger = logging.getLogger(__name__)
+    per_shell_engine = CorrelationEngine()
+    per_shell_results = []
+
+    for bar_eid, info in sorted(connectivity.items()):
+        h5_data = h5_reader.get_joint_loads_for_bar(bar_eid)
+        if h5_data is None or h5_data.empty:
+            continue
+
+        sc_keys = [k for k in bar_forces.keys() if k[1] == bar_eid]
+        if not sc_keys:
+            continue
+
+        shell_info = {}
+        for qeid in info.connected_quads:
+            shell_info[qeid] = "CQUAD4"
+        for teid in info.connected_trias:
+            shell_info[teid] = "CTRIA3"
+
+        collected_sc_ids = []
+        collected_axial = []
+
+        for sc_id_key, _ in sc_keys:
+            if subcase_id is not None and sc_id_key != subcase_id:
+                continue
+            bar_result = bar_forces.get((sc_id_key, bar_eid))
+            if bar_result is None:
+                continue
+            collected_sc_ids.append(sc_id_key)
+            collected_axial.append(np.mean(bar_result.axial_force))
+
+        if not collected_sc_ids:
+            continue
+
+        et_col = _find_element_type_col(h5_data)
+        sc_col = _find_subcase_col(h5_data)
+        element_types = sorted(h5_data[et_col].unique()) if et_col else [0]
+
+        for shell_eid, shell_type_str in shell_info.items():
+            per_shell_sc_ids = []
+            per_shell_axial = []
+            per_shell_nx = []
+            per_shell_ny = []
+            per_shell_nxy = []
+
+            for i, sc_id in enumerate(collected_sc_ids):
+                sf = shell_forces.get((sc_id, shell_eid))
+                if sf is None:
+                    continue
+                per_shell_sc_ids.append(sc_id)
+                per_shell_axial.append(collected_axial[i])
+                per_shell_nx.append(np.mean(sf.membrane_x))
+                per_shell_ny.append(np.mean(sf.membrane_y))
+                per_shell_nxy.append(np.mean(sf.membrane_xy))
+
+            if not per_shell_sc_ids:
+                continue
+
+            op2_by_sc = {}
+            for i, sc_id in enumerate(per_shell_sc_ids):
+                op2_by_sc[sc_id] = (
+                    per_shell_axial[i],
+                    per_shell_nx[i],
+                    per_shell_ny[i],
+                    per_shell_nxy[i],
+                )
+
+            n_shells_total = len(shell_info)
+
+            for et in element_types:
+                h5_subset = h5_data[h5_data[et_col] == et].copy() if et_col else h5_data
+                if h5_subset.empty:
+                    continue
+
+                if sc_col is not None:
+                    matched_axial = []
+                    matched_nx = []
+                    matched_ny = []
+                    matched_nxy = []
+                    matched_h5_indices = []
+                    matched_sc_ids = []
+
+                    for idx, row in h5_subset.iterrows():
+                        h5_sc = int(row[sc_col])
+                        if h5_sc in op2_by_sc:
+                            ax, nx, ny, nxy = op2_by_sc[h5_sc]
+                            matched_axial.append(ax)
+                            matched_nx.append(nx)
+                            matched_ny.append(ny)
+                            matched_nxy.append(nxy)
+                            matched_h5_indices.append(idx)
+                            matched_sc_ids.append(h5_sc)
+
+                    if not matched_h5_indices:
+                        continue
+
+                    h5_matched = h5_subset.loc[matched_h5_indices].reset_index(drop=True)
+                    pred_axial = np.array(matched_axial)
+                    pred_nx = np.array(matched_nx)
+                    pred_ny = np.array(matched_ny)
+                    pred_nxy = np.array(matched_nxy)
+                else:
+                    h5_matched = h5_subset
+                    pred_axial = np.array(per_shell_axial)
+                    pred_nx = np.array(per_shell_nx)
+                    pred_ny = np.array(per_shell_ny)
+                    pred_nxy = np.array(per_shell_nxy)
+                    matched_sc_ids = list(per_shell_sc_ids)
+
+                result = per_shell_engine.compute_joint_correlation(
+                    bar_eid=bar_eid,
+                    subcase_id=0,
+                    element_type=int(et),
+                    bar_axial=pred_axial,
+                    avg_shell_nx=pred_nx,
+                    avg_shell_ny=pred_ny,
+                    avg_shell_nxy=pred_nxy,
+                    h5_data=h5_matched,
+                    n_shells=n_shells_total,
+                )
+                result.shell_eid = shell_eid
+                result.shell_type = shell_type_str
+                result.matched_subcases = matched_sc_ids
+                per_shell_results.append(result)
+
+                logger.info(
+                    "  Bar %d, Shell %d (%s), ET %s: %d denklem",
+                    bar_eid, shell_eid, shell_type_str, et, len(result.equations),
+                )
+
+    logger.info("Per-shell korelasyon: %d sonuc uretildi", len(per_shell_results))
+    return per_shell_results
+
+
 # ============================================================
 #  GUI Bilesenleri
 # ============================================================
@@ -2098,6 +2249,13 @@ class Application(tk.Tk):
             correlation_summary = engine.get_summary_dataframe()
             logger.info("  %d korelasyon sonucu", len(correlation_results))
 
+            # ADIM 5b: Per-shell korelasyon
+            logger.info("ADIM 5b: Per-shell korelasyon analizi...")
+            per_shell_results = run_per_shell_correlation_analysis(
+                connectivity, bar_forces, shell_forces, h5_reader, subcase_id
+            )
+            logger.info("  %d per-shell korelasyon sonucu", len(per_shell_results))
+
             # ADIM 6
             self._update_status("Adim 6/6: Rapor olusturuluyor...")
             logger.info("ADIM 6: Excel raporu olusturuluyor...")
@@ -2114,6 +2272,7 @@ class Application(tk.Tk):
                 h5_joint_loads=h5_reader.joint_load_cap,
                 correlation_results=correlation_results,
                 correlation_summary_df=correlation_summary,
+                per_shell_results=per_shell_results,
             )
 
             logger.info("=" * 50)
@@ -2278,6 +2437,18 @@ def run_cli(args: argparse.Namespace) -> None:
     correlation_summary = engine.get_summary_dataframe()
     logger.info("  %d korelasyon sonucu hesaplandi", len(correlation_results))
 
+    # ADIM 5b: Per-shell korelasyon
+    logger.info("-" * 40)
+    logger.info("ADIM 5b: Per-shell korelasyon analizi yapiliyor...")
+    per_shell_results = run_per_shell_correlation_analysis(
+        connectivity=connectivity,
+        bar_forces=bar_forces,
+        shell_forces=shell_forces,
+        h5_reader=h5_reader,
+        subcase_id=args.subcase,
+    )
+    logger.info("  %d per-shell korelasyon sonucu", len(per_shell_results))
+
     # ADIM 6
     logger.info("-" * 40)
     logger.info("ADIM 6: Excel raporu olusturuluyor...")
@@ -2294,6 +2465,7 @@ def run_cli(args: argparse.Namespace) -> None:
         h5_joint_loads=h5_reader.joint_load_cap,
         correlation_results=correlation_results,
         correlation_summary_df=correlation_summary,
+        per_shell_results=per_shell_results,
     )
 
     elapsed = time.time() - start_time

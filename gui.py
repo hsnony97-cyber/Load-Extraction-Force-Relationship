@@ -326,6 +326,7 @@ class Application(tk.Tk):
                 build_bar_forces_dataframe,
                 build_shell_forces_dataframe,
                 run_correlation_analysis,
+                run_per_shell_correlation_analysis,
             )
 
             bdf_path = self.bdf_selector.get()
@@ -388,6 +389,13 @@ class Application(tk.Tk):
             correlation_summary = engine.get_summary_dataframe()
             logger.info("  %d korelasyon sonucu", len(correlation_results))
 
+            # ADIM 5b: Per-shell korelasyon
+            logger.info("ADIM 5b: Per-shell korelasyon analizi...")
+            per_shell_results = run_per_shell_correlation_analysis(
+                connectivity, bar_forces, shell_forces, h5_reader, subcase_id
+            )
+            logger.info("  %d per-shell korelasyon sonucu", len(per_shell_results))
+
             # ADIM 6
             self._update_status("Adim 6/6: Rapor olusturuluyor...")
             logger.info("ADIM 6: Excel raporu olusturuluyor...")
@@ -404,6 +412,7 @@ class Application(tk.Tk):
                 h5_joint_loads=h5_reader.joint_load_cap,
                 correlation_results=correlation_results,
                 correlation_summary_df=correlation_summary,
+                per_shell_results=per_shell_results,
             )
 
             logger.info("=" * 50)

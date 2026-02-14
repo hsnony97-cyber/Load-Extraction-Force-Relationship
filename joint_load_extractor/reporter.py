@@ -50,6 +50,7 @@ class ReportGenerator:
         h5_joint_loads: pd.DataFrame,
         correlation_results: List[JointCorrelationResult],
         correlation_summary_df: pd.DataFrame,
+        per_shell_results: Optional[List[JointCorrelationResult]] = None,
     ) -> str:
         """
         Tam raporu oluştur.
@@ -126,9 +127,10 @@ class ReportGenerator:
                 header_fmt, number_fmt, int_fmt, border_fmt,
             )
 
-            # 8. Total Summary - tum bar elementler icin tek tablo
+            # 8. Total Summary - tum bar elementler icin tek tablo (per-shell)
             self._write_total_summary(
-                writer, workbook, connectivity, correlation_results,
+                writer, workbook, connectivity,
+                per_shell_results if per_shell_results else correlation_results,
                 header_fmt, number_fmt, int_fmt, border_fmt,
             )
 
@@ -247,18 +249,17 @@ class ReportGenerator:
         header_fmt, number_fmt, int_fmt, border_fmt,
     ):
         """
-        Total Summary sheet'i - tum bar elementler icin tek tablo.
+        Total Summary sheet'i - per-shell bazinda tum bar elementler icin tek tablo.
 
-        Her satir bir (Bar_EID, Element_Type) kombinasyonu.
+        Per-shell sonuclari varsa (shell_eid != None), her satir bir
+        (Bar_EID, Shell_EID, Shell_Type, Element_Type) kombinasyonu.
+        Yoksa fallback olarak (Bar_EID, Element_Type) kullanilir.
+
         Kolonlar:
-          Bar_EID | Element_Type | N_Shells | N_Subcases |
-          Coeff_Bar_Axial_FBX | Coeff_Shell_Nx_FBX | Coeff_Shell_Ny_FBX | Coeff_Shell_Nxy_FBX | Intercept_FBX | R2_FBX |
-          Coeff_Bar_Axial_FBY | ... | R2_FBY |
-          Coeff_Bar_Axial_NXByp | ... | R2_NXByp |
-          Coeff_Bar_Axial_NYByp | ... | R2_NYByp |
-          Coeff_Bar_Axial_NXYByp | ... | R2_NXYByp |
+          Bar_EID | Shell_EID | Shell_Type | Element_Type | N_Shells | N_Subcases |
+          Coeff_Bar_Axial_FBX | Coeff_Shell_Nx_FBX | ... | R2_FBX |
+          Coeff_Bar_Axial_FBY | ... | R2_FBY | ... (5 hedef)
         """
-        # Hedef kisa isimleri
         target_short = {
             "F Bearing X": "FBX",
             "F Bearing Y": "FBY",
@@ -271,6 +272,8 @@ class ReportGenerator:
         for res in correlation_results:
             row = {
                 "Bar_EID": res.bar_eid,
+                "Shell_EID": res.shell_eid if res.shell_eid is not None else "",
+                "Shell_Type": res.shell_type if res.shell_type is not None else "",
                 "Element_Type": res.element_type,
                 "N_Shells": res.n_connected_shells,
                 "N_Subcases": len(res.matched_subcases) if res.matched_subcases else 0,
@@ -281,13 +284,9 @@ class ReportGenerator:
             if info:
                 row["Node_A"] = info.node_a
                 row["Node_B"] = info.node_b
-                row["Connected_QUADs"] = len(info.connected_quads)
-                row["Connected_TRIAs"] = len(info.connected_trias)
             else:
                 row["Node_A"] = ""
                 row["Node_B"] = ""
-                row["Connected_QUADs"] = 0
-                row["Connected_TRIAs"] = 0
 
             # Her hedef icin katsayi + R²
             eq_map = {eq.target_name: eq for eq in res.equations}
@@ -323,11 +322,12 @@ class ReportGenerator:
             ws.write(0, col_idx, col_name, header_fmt)
 
         # Kolon genislikleri
-        ws.set_column(0, 0, 10)   # Bar_EID
-        ws.set_column(1, 1, 12)   # Element_Type
-        ws.set_column(2, 3, 10)   # N_Shells, N_Subcases
-        ws.set_column(4, 5, 10)   # Node_A, Node_B
-        ws.set_column(6, 7, 14)   # Connected_QUADs, Connected_TRIAs
+        ws.set_column(0, 0, 12)   # Bar_EID
+        ws.set_column(1, 1, 12)   # Shell_EID
+        ws.set_column(2, 2, 10)   # Shell_Type
+        ws.set_column(3, 3, 12)   # Element_Type
+        ws.set_column(4, 5, 10)   # N_Shells, N_Subcases
+        ws.set_column(6, 7, 10)   # Node_A, Node_B
         ws.set_column(8, len(df.columns) - 1, 18)  # Katsayi kolonlari
 
         # R² renklendirme
@@ -338,7 +338,6 @@ class ReportGenerator:
             "num_format": "0.0000", "border": 1, "bg_color": self.CORR_NEG_COLOR,
         })
 
-        # R² kolonlarini bul ve renklendir
         r2_cols = [col for col in df.columns if col.startswith("R2_")]
         for r2_col in r2_cols:
             col_idx = list(df.columns).index(r2_col)
@@ -348,10 +347,10 @@ class ReportGenerator:
                     fmt = good_r2_fmt if val >= 0.7 else bad_r2_fmt
                     ws.write(row_idx + 1, col_idx, val, fmt)
 
-        # Freeze panes: baslik satiri ve ilk 2 kolon sabit
-        ws.freeze_panes(1, 2)
+        # Freeze panes: baslik satiri ve ilk 3 kolon sabit (Bar_EID, Shell_EID, Shell_Type)
+        ws.freeze_panes(1, 3)
 
-        logger.info("Total Summary: %d satir yazildi", len(rows))
+        logger.info("Total Summary: %d satir yazildi (per-shell)", len(rows))
 
     def _write_predicted_vs_actual(
         self, writer, workbook, correlation_results,

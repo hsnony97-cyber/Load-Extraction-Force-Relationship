@@ -61,6 +61,8 @@ class JointCorrelationResult:
     subcase_id: int
     element_type: int  # H5'teki Element Type (0, 1, ...)
     n_connected_shells: int
+    shell_eid: Optional[int] = None       # Per-shell analiz icin shell element ID
+    shell_type: Optional[str] = None      # Per-shell analiz icin shell tipi (CQUAD4, CTRIA3, ...)
     equations: List[RegressionEquation] = field(default_factory=list)
     predictor_data: Dict[str, np.ndarray] = field(default_factory=dict)
     target_data: Dict[str, np.ndarray] = field(default_factory=dict)
