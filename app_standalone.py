@@ -1059,6 +1059,12 @@ class ReportGenerator:
                 header_fmt, number_fmt, int_fmt, border_fmt,
             )
 
+            # Total Summary - tum bar elementler icin tek tablo
+            self._write_total_summary(
+                writer, workbook, connectivity, correlation_results,
+                header_fmt, number_fmt, int_fmt, border_fmt,
+            )
+
             self._write_per_bar_details(
                 writer, workbook, connectivity, correlation_results,
                 header_fmt, number_fmt, int_fmt, bar_fmt, quad_fmt, tria_fmt, border_fmt,
@@ -1139,6 +1145,104 @@ class ReportGenerator:
             ws.write(0, col_idx, col_name, header_fmt)
             max_len = max(len(str(col_name)), df[col_name].astype(str).str.len().max())
             ws.set_column(col_idx, col_idx, min(max_len + 2, 25))
+
+    def _write_total_summary(
+        self, writer, workbook, connectivity, correlation_results,
+        header_fmt, number_fmt, int_fmt, border_fmt,
+    ):
+        """
+        Total Summary sheet'i - tum bar elementler icin tek tablo.
+
+        Her satir bir (Bar_EID, Element_Type) kombinasyonu.
+        """
+        logger = logging.getLogger(__name__)
+        target_short = {
+            "F Bearing X": "FBX",
+            "F Bearing Y": "FBY",
+            "NX Bypass": "NX_Byp",
+            "NY Bypass": "NY_Byp",
+            "NXY Bypass": "NXY_Byp",
+        }
+
+        rows = []
+        for res in correlation_results:
+            row = {
+                "Bar_EID": res.bar_eid,
+                "Element_Type": res.element_type,
+                "N_Shells": res.n_connected_shells,
+                "N_Subcases": len(res.matched_subcases) if res.matched_subcases else 0,
+            }
+
+            info = connectivity.get(res.bar_eid)
+            if info:
+                row["Node_A"] = info.node_a
+                row["Node_B"] = info.node_b
+                row["Connected_QUADs"] = len(info.connected_quads)
+                row["Connected_TRIAs"] = len(info.connected_trias)
+            else:
+                row["Node_A"] = ""
+                row["Node_B"] = ""
+                row["Connected_QUADs"] = 0
+                row["Connected_TRIAs"] = 0
+
+            eq_map = {eq.target_name: eq for eq in res.equations}
+            for target_name, short in target_short.items():
+                eq = eq_map.get(target_name)
+                if eq is not None:
+                    row[f"Coeff_Bar_Axial_{short}"] = float(eq.coefficients[0])
+                    row[f"Coeff_Shell_Nx_{short}"] = float(eq.coefficients[1])
+                    row[f"Coeff_Shell_Ny_{short}"] = float(eq.coefficients[2])
+                    row[f"Coeff_Shell_Nxy_{short}"] = float(eq.coefficients[3])
+                    row[f"Intercept_{short}"] = float(eq.intercept)
+                    row[f"R2_{short}"] = eq.r_squared
+                else:
+                    row[f"Coeff_Bar_Axial_{short}"] = ""
+                    row[f"Coeff_Shell_Nx_{short}"] = ""
+                    row[f"Coeff_Shell_Ny_{short}"] = ""
+                    row[f"Coeff_Shell_Nxy_{short}"] = ""
+                    row[f"Intercept_{short}"] = ""
+                    row[f"R2_{short}"] = ""
+
+            rows.append(row)
+
+        if not rows:
+            logger.info("Total Summary: veri yok, sheet atlaniyor")
+            return
+
+        df = pd.DataFrame(rows)
+        sheet_name = "Total Summary"
+        df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=1)
+        ws = writer.sheets[sheet_name]
+
+        for col_idx, col_name in enumerate(df.columns):
+            ws.write(0, col_idx, col_name, header_fmt)
+
+        ws.set_column(0, 0, 10)
+        ws.set_column(1, 1, 12)
+        ws.set_column(2, 3, 10)
+        ws.set_column(4, 5, 10)
+        ws.set_column(6, 7, 14)
+        ws.set_column(8, len(df.columns) - 1, 18)
+
+        good_r2_fmt = workbook.add_format({
+            "num_format": "0.0000", "border": 1, "bg_color": self.CORR_POS_COLOR,
+        })
+        bad_r2_fmt = workbook.add_format({
+            "num_format": "0.0000", "border": 1, "bg_color": self.CORR_NEG_COLOR,
+        })
+
+        r2_cols = [col for col in df.columns if col.startswith("R2_")]
+        for r2_col in r2_cols:
+            col_idx = list(df.columns).index(r2_col)
+            for row_idx, row_data in enumerate(rows):
+                val = row_data.get(r2_col, "")
+                if isinstance(val, (int, float)):
+                    fmt = good_r2_fmt if val >= 0.7 else bad_r2_fmt
+                    ws.write(row_idx + 1, col_idx, val, fmt)
+
+        ws.freeze_panes(1, 2)
+
+        logger.info("Total Summary: %d satir yazildi", len(rows))
 
     def _write_predicted_vs_actual(
         self, writer, workbook, correlation_results,
