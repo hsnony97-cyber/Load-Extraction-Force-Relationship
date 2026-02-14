@@ -879,9 +879,9 @@ class CorrelationEngine:
 
         predictors = {
             "Bar_Axial": np.asarray(bar_axial, dtype=float),
-            "Avg_Shell_Nx": np.asarray(avg_shell_nx, dtype=float),
-            "Avg_Shell_Ny": np.asarray(avg_shell_ny, dtype=float),
-            "Avg_Shell_Nxy": np.asarray(avg_shell_nxy, dtype=float),
+            "Shell_Nx": np.asarray(avg_shell_nx, dtype=float),
+            "Shell_Ny": np.asarray(avg_shell_ny, dtype=float),
+            "Shell_Nxy": np.asarray(avg_shell_nxy, dtype=float),
         }
         result.predictor_data = predictors
 
@@ -1195,8 +1195,8 @@ class ReportGenerator:
                     continue
 
                 eq_headers = [
-                    "Target", "Coeff Bar_Axial", "Coeff Avg_Nx",
-                    "Coeff Avg_Ny", "Coeff Avg_Nxy", "Intercept", "R²",
+                    "Target", "Coeff Bar_Axial", "Coeff Shell_Nx",
+                    "Coeff Shell_Ny", "Coeff Shell_Nxy", "Intercept", "R²",
                 ]
                 for j, h in enumerate(eq_headers):
                     ws.write(row, j, h, header_fmt)
@@ -1348,7 +1348,7 @@ def run_correlation_analysis(
 
     Her bar element + element type icin TUM SUBCASE'LER uzerinden
     veri toplayarak coklu regresyon denklemi olusturur:
-      Target = a1*Bar_Axial + a2*Avg_Nx + a3*Avg_Ny + a4*Avg_Nxy + b
+      Target = a1*Bar_Axial + a2*Shell_Nx + a3*Shell_Ny + a4*Shell_Nxy + b
     """
     logger = logging.getLogger(__name__)
     engine = CorrelationEngine()

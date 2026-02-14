@@ -7,9 +7,9 @@ arasinda coklu regresyon denklemi olusturur.
 
 Her bar element icin 4 predictor (bagımsız degisken):
   - Bar Axial Force (OP2)
-  - Avg Shell Nx (bagli tum shell'lerin ortalamasi, OP2)
-  - Avg Shell Ny (bagli tum shell'lerin ortalamasi, OP2)
-  - Avg Shell Nxy (bagli tum shell'lerin ortalamasi, OP2)
+  - Shell Nx (bagli tum shell'lerin ortalamasi, OP2)
+  - Shell Ny (bagli tum shell'lerin ortalamasi, OP2)
+  - Shell Nxy (bagli tum shell'lerin ortalamasi, OP2)
 
 5 hedef (bagimli degisken, H5'ten):
   - F Bearing X
@@ -19,7 +19,7 @@ Her bar element icin 4 predictor (bagımsız degisken):
   - NXY Bypass
 
 Denklem:
-  Target = a1*Bar_Axial + a2*Avg_Nx + a3*Avg_Ny + a4*Avg_Nxy + b
+  Target = a1*Bar_Axial + a2*Shell_Nx + a3*Shell_Ny + a4*Shell_Nxy + b
 """
 
 import logging
@@ -32,7 +32,7 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 
-PREDICTOR_NAMES = ["Bar_Axial", "Avg_Shell_Nx", "Avg_Shell_Ny", "Avg_Shell_Nxy"]
+PREDICTOR_NAMES = ["Bar_Axial", "Shell_Nx", "Shell_Ny", "Shell_Nxy"]
 H5_TARGET_COLUMNS = ["F Bearing X", "F Bearing Y", "NX Bypass", "NY Bypass", "NXY Bypass"]
 
 
@@ -120,9 +120,9 @@ class CorrelationEngine:
         # Predictor verileri
         predictors = {
             "Bar_Axial": np.asarray(bar_axial, dtype=float),
-            "Avg_Shell_Nx": np.asarray(avg_shell_nx, dtype=float),
-            "Avg_Shell_Ny": np.asarray(avg_shell_ny, dtype=float),
-            "Avg_Shell_Nxy": np.asarray(avg_shell_nxy, dtype=float),
+            "Shell_Nx": np.asarray(avg_shell_nx, dtype=float),
+            "Shell_Ny": np.asarray(avg_shell_ny, dtype=float),
+            "Shell_Nxy": np.asarray(avg_shell_nxy, dtype=float),
         }
         result.predictor_data = predictors
 

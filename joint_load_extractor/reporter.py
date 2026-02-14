@@ -295,8 +295,8 @@ class ReportGenerator:
 
                 # Tablo basliklari
                 eq_headers = [
-                    "Target", "Coeff Bar_Axial", "Coeff Avg_Nx",
-                    "Coeff Avg_Ny", "Coeff Avg_Nxy", "Intercept", "R²",
+                    "Target", "Coeff Bar_Axial", "Coeff Shell_Nx",
+                    "Coeff Shell_Ny", "Coeff Shell_Nxy", "Intercept", "R²",
                 ]
                 for j, h in enumerate(eq_headers):
                     ws.write(row, j, h, header_fmt)
