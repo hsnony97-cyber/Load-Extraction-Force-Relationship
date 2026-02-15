@@ -1568,38 +1568,46 @@ def read_prediction_h5(h5_path: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
 
 
 def read_coefficients_from_excel(excel_path: str) -> pd.DataFrame:
-    """Correlation Summary Excel'deki 'Total Summary' sheet'ini oku."""
+    """Correlation Summary Excel'deki katsayilari oku (ortalama shell)."""
     logger = logging.getLogger(__name__)
     logger.info("Katsayilar Excel'den okunuyor: %s", excel_path)
 
-    try:
-        df = pd.read_excel(excel_path, sheet_name="Total Summary")
-    except ValueError:
-        xls = pd.ExcelFile(excel_path)
-        logger.info("Excel sheet'leri: %s", xls.sheet_names)
-        found = None
-        for name in xls.sheet_names:
-            if "total" in name.lower() and "summary" in name.lower():
-                found = name
-                break
-        if found is None:
-            for name in xls.sheet_names:
-                if "summary" in name.lower():
-                    found = name
-                    break
-        if found is None:
-            raise ValueError(
-                f"Excel dosyasinda 'Total Summary' sheet'i bulunamadi. "
-                f"Mevcut sheet'ler: {xls.sheet_names}"
-            )
-        df = pd.read_excel(excel_path, sheet_name=found)
-        logger.info("'%s' sheet'i kullanildi", found)
+    xls = pd.ExcelFile(excel_path)
+    sheet_names = xls.sheet_names
+    logger.info("Excel sheet'leri: %s", sheet_names)
 
-    required = ["Bar_EID", "Element_Type", "Shell_EID", "Target", "Intercept"]
+    df = None
+    for candidate in ["Correlation Summary", "Total Summary"]:
+        if candidate in sheet_names:
+            df = pd.read_excel(excel_path, sheet_name=candidate)
+            logger.info("'%s' sheet'i kullanildi", candidate)
+            break
+
+    if df is None:
+        for name in sheet_names:
+            if "correlation" in name.lower() and "summary" in name.lower():
+                df = pd.read_excel(excel_path, sheet_name=name)
+                logger.info("'%s' sheet'i kullanildi", name)
+                break
+
+    if df is None:
+        for name in sheet_names:
+            if "summary" in name.lower():
+                df = pd.read_excel(excel_path, sheet_name=name)
+                logger.info("'%s' sheet'i kullanildi", name)
+                break
+
+    if df is None:
+        raise ValueError(
+            f"Excel dosyasinda uygun summary sheet'i bulunamadi. "
+            f"Mevcut sheet'ler: {sheet_names}"
+        )
+
+    required = ["Bar_EID", "Element_Type", "Target", "Intercept"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(
-            f"Total Summary'de eksik kolonlar: {missing}. "
+            f"Summary sheet'te eksik kolonlar: {missing}. "
             f"Mevcut kolonlar: {list(df.columns)}"
         )
 
@@ -1607,10 +1615,34 @@ def read_coefficients_from_excel(excel_path: str) -> pd.DataFrame:
     return df
 
 
+def _extract_connectivity_from_excel(excel_path: str) -> Dict[int, List[int]]:
+    """Total Summary sheet'inden bar_eid -> [shell_eids] eslesmesini cikar."""
+    logger = logging.getLogger(__name__)
+    logger.info("Connectivity bilgisi Excel'den cikariliyor...")
+    xls = pd.ExcelFile(excel_path)
+
+    for candidate in ["Total Summary"]:
+        if candidate in xls.sheet_names:
+            df = pd.read_excel(excel_path, sheet_name=candidate)
+            if "Bar_EID" in df.columns and "Shell_EID" in df.columns:
+                shell_map = {}
+                for bar_eid, group in df.groupby("Bar_EID"):
+                    shell_eids = group["Shell_EID"].dropna()
+                    shell_eids = [int(s) for s in shell_eids if str(s).strip() and str(s).strip() != ""]
+                    if shell_eids:
+                        shell_map[int(bar_eid)] = list(set(shell_eids))
+                logger.info("  %d bar element icin connectivity bulundu", len(shell_map))
+                return shell_map
+
+    logger.warning("Excel'den connectivity bilgisi cikarilmadi")
+    return {}
+
+
 def predict_from_h5(
-    per_shell_results: List[JointCorrelationResult],
+    correlation_results: List[JointCorrelationResult],
     prediction_h5_path: str,
     output_csv: str,
+    connectivity: Dict = None,
 ) -> pd.DataFrame:
     """In-memory korelasyon sonuclari + Prediction H5 -> tahmin CSV."""
     logger = logging.getLogger(__name__)
@@ -1624,14 +1656,13 @@ def predict_from_h5(
         return pd.DataFrame()
 
     coeff_rows = []
-    for res in per_shell_results:
+    for res in correlation_results:
         if not res.equations:
             continue
         for eq in res.equations:
             row = {
                 "Bar_EID": res.bar_eid,
                 "Element_Type": res.element_type,
-                "Shell_EID": res.shell_eid if res.shell_eid is not None else "",
                 "Target": eq.target_name,
             }
             for pname, coeff in zip(eq.predictor_names, eq.coefficients):
@@ -1644,7 +1675,8 @@ def predict_from_h5(
         return pd.DataFrame()
 
     coeff_df = pd.DataFrame(coeff_rows)
-    return _run_prediction(coeff_df, bar_df, shell_df, output_csv)
+    shell_eid_map = _build_shell_eid_map(connectivity)
+    return _run_prediction(coeff_df, bar_df, shell_df, output_csv, shell_eid_map)
 
 
 def predict_from_excel_and_h5(
@@ -1664,44 +1696,39 @@ def predict_from_excel_and_h5(
         logger.error("Prediction H5'te shell force verisi bulunamadi")
         return pd.DataFrame()
 
-    return _run_prediction(coeff_df, bar_df, shell_df, output_csv)
+    shell_eid_map = _extract_connectivity_from_excel(coefficients_excel)
+    return _run_prediction(coeff_df, bar_df, shell_df, output_csv, shell_eid_map)
 
 
 def predict_from_results(
-    per_shell_results: List[JointCorrelationResult],
-    bar_forces: Dict,
-    shell_forces: Dict,
+    correlation_results: List[JointCorrelationResult],
     output_csv: str,
 ) -> pd.DataFrame:
     """
-    Mevcut OP2 verileri ile tahmin (fallback).
-    Predicted vs Actual mantigi ile birebir ayni:
-      predictor = [bar_axial, shell_nx, shell_ny, shell_nxy]
-      predicted = predictor @ coefficients + intercept
+    In-memory korelasyon sonuclariyla tahmin (Predicted vs Actual mantigi).
+    correlation_results kullanir (ortalama shell kuvvetleri ile regresyon).
+    Her (bar_eid, element_type) icin TEK sonuc satirlari uretir.
     """
     logger = logging.getLogger(__name__)
     rows = []
 
-    for res in per_shell_results:
-        if not res.equations:
+    for res in correlation_results:
+        if not res.equations or not res.predictor_data:
             continue
+
         bar_eid = res.bar_eid
         element_type = res.element_type
-        if res.shell_eid is None:
-            continue
 
-        subcases = res.matched_subcases if res.matched_subcases else []
-        pred_names = list(res.predictor_data.keys()) if res.predictor_data else []
-        n = min(len(v) for v in res.predictor_data.values()) if res.predictor_data else 0
-
+        pred_names = list(res.predictor_data.keys())
+        n = min(len(v) for v in res.predictor_data.values())
         if n == 0:
             continue
 
         X = np.column_stack([res.predictor_data[k][:n] for k in pred_names])
-        sc_list = subcases[:n]
+        subcases = res.matched_subcases[:n] if res.matched_subcases else [0] * n
 
         for i in range(n):
-            sc_id = sc_list[i] if i < len(sc_list) else 0
+            sc_id = subcases[i] if i < len(subcases) else 0
             row = {
                 "Bar_EID": bar_eid,
                 "Element_Type": element_type,
@@ -1731,11 +1758,24 @@ def predict_from_dataframes(
     bar_forces_df: pd.DataFrame,
     shell_forces_df: pd.DataFrame,
     output_csv: str,
+    shell_eid_map: Dict[int, List[int]] = None,
 ) -> pd.DataFrame:
-    """DataFrame formatindaki verilerle tahmin yap (eski uyumluluk)."""
+    """DataFrame formatindaki verilerle tahmin yap."""
     bar_df = _pred_normalize_bar_df(bar_forces_df)
     shell_df = _pred_normalize_shell_df(shell_forces_df)
-    return _run_prediction(coefficients_df, bar_df, shell_df, output_csv)
+    return _run_prediction(coefficients_df, bar_df, shell_df, output_csv, shell_eid_map or {})
+
+
+def _build_shell_eid_map(connectivity) -> Dict[int, List[int]]:
+    """Connectivity dict'ten bar_eid -> [shell_eids] mapping olustur."""
+    shell_map = {}
+    if connectivity is None:
+        return shell_map
+    for bar_eid, info in connectivity.items():
+        eids = list(info.connected_quads.keys()) + list(info.connected_trias.keys())
+        if eids:
+            shell_map[int(bar_eid)] = eids
+    return shell_map
 
 
 def _run_prediction(
@@ -1743,13 +1783,18 @@ def _run_prediction(
     bar_df: pd.DataFrame,
     shell_df: pd.DataFrame,
     output_csv: str,
+    shell_eid_map: Dict[int, List[int]] = None,
 ) -> pd.DataFrame:
     """
     Predicted vs Actual mantigi ile birebir ayni tahmin.
-      predictor = [bar_axial(AF), shell_nx, shell_ny, shell_nxy]
+      predictor = [bar_axial(AF), avg_shell_nx, avg_shell_ny, avg_shell_nxy]
       predicted = predictor @ coefficients + intercept
+    Tum bagli shell'lerin NX/NY/NXY ortalamasi alinir.
     Cikti wide format: Bar_EID, Element_Type, Subcase_ID, Pred_FX, Pred_FY, Pred_NX, Pred_NY, Pred_NXY
     """
+    if shell_eid_map is None:
+        shell_eid_map = {}
+
     logger = logging.getLogger(__name__)
     bar_df = _pred_normalize_bar_df(bar_df)
     shell_df = _pred_normalize_shell_df(shell_df)
@@ -1758,9 +1803,9 @@ def _run_prediction(
                 len(bar_df), len(shell_df), len(coeff_df))
 
     rows = []
-    groups = coeff_df.groupby(["Bar_EID", "Element_Type", "Shell_EID"])
+    groups = coeff_df.groupby(["Bar_EID", "Element_Type"])
 
-    for (bar_eid, et, shell_eid), group in groups:
+    for (bar_eid, et), group in groups:
         eq_map = {}
         for _, coeff_row in group.iterrows():
             target = coeff_row["Target"]
@@ -1776,24 +1821,30 @@ def _run_prediction(
 
         bar_mask = bar_df["bar_eid"] == int(bar_eid)
         bar_subset = bar_df[bar_mask]
-        shell_mask = shell_df["element_id"] == int(shell_eid)
-        shell_subset = shell_df[shell_mask]
+        if bar_subset.empty:
+            continue
 
-        if bar_subset.empty or shell_subset.empty:
+        connected_shells = shell_eid_map.get(int(bar_eid), [])
+        if not connected_shells:
+            logger.debug("Bar %d: Bagli shell bilgisi yok, atlaniyor", bar_eid)
             continue
 
         for _, bar_row in bar_subset.iterrows():
             sc_id = bar_row["subcase_id"]
             af = float(bar_row["af"])
-            shell_sc = shell_subset[shell_subset["subcase_id"] == sc_id]
-            if shell_sc.empty:
+
+            shell_sc_data = shell_df[
+                (shell_df["element_id"].isin(connected_shells)) &
+                (shell_df["subcase_id"] == sc_id)
+            ]
+            if shell_sc_data.empty:
                 continue
 
-            nx = float(shell_sc["nx"].mean())
-            ny = float(shell_sc["ny"].mean())
-            nxy = float(shell_sc["nxy"].mean())
+            avg_nx = float(shell_sc_data["nx"].mean())
+            avg_ny = float(shell_sc_data["ny"].mean())
+            avg_nxy = float(shell_sc_data["nxy"].mean())
 
-            predictor = np.array([af, nx, ny, nxy])
+            predictor = np.array([af, avg_nx, avg_ny, avg_nxy])
 
             row = {
                 "Bar_EID": int(bar_eid),
@@ -2681,20 +2732,18 @@ class Application(tk.Tk):
             logger.info("ADIM 7: Tahmin CSV olusturuluyor...")
 
             csv_path = str(Path(output_path).with_suffix(".csv"))
-            results_for_pred = per_shell_results if per_shell_results else correlation_results
 
             if pred_h5_path and Path(pred_h5_path).exists():
                 logger.info("  Prediction H5 dosyasi kullaniliyor: %s", pred_h5_path)
                 pred_df = predict_from_h5(
-                    per_shell_results=results_for_pred,
+                    correlation_results=correlation_results,
                     prediction_h5_path=pred_h5_path,
                     output_csv=csv_path,
+                    connectivity=connectivity,
                 )
             else:
                 pred_df = predict_from_results(
-                    per_shell_results=results_for_pred,
-                    bar_forces=bar_forces,
-                    shell_forces=shell_forces,
+                    correlation_results=correlation_results,
                     output_csv=csv_path,
                 )
             logger.info("  %d tahmin satiri yazildi: %s", len(pred_df), csv_path)
@@ -2900,21 +2949,19 @@ def run_cli(args: argparse.Namespace) -> None:
     logger.info("ADIM 7: Tahmin CSV olusturuluyor...")
 
     csv_path = str(Path(args.output).with_suffix(".csv"))
-    results_for_pred = per_shell_results if per_shell_results else correlation_results
 
     prediction_h5 = getattr(args, "prediction_h5", None)
     if prediction_h5 and Path(prediction_h5).exists():
         logger.info("  Prediction H5 dosyasi kullaniliyor: %s", prediction_h5)
         pred_df = predict_from_h5(
-            per_shell_results=results_for_pred,
+            correlation_results=correlation_results,
             prediction_h5_path=prediction_h5,
             output_csv=csv_path,
+            connectivity=connectivity,
         )
     else:
         pred_df = predict_from_results(
-            per_shell_results=results_for_pred,
-            bar_forces=bar_forces,
-            shell_forces=shell_forces,
+            correlation_results=correlation_results,
             output_csv=csv_path,
         )
     logger.info("  %d tahmin satiri yazildi: %s", len(pred_df), csv_path)

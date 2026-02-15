@@ -723,23 +723,21 @@ Ornek kullanim:
     logger.info("ADIM 7: Tahmin CSV olusturuluyor...")
 
     csv_path = str(Path(args.output).with_suffix(".csv"))
-    results_for_pred = per_shell_results if per_shell_results else correlation_results
 
     prediction_h5 = getattr(args, "prediction_h5", None)
     if prediction_h5:
-        # Ayri Prediction H5 dosyasindan oku
+        # Ayri Prediction H5 dosyasindan oku + ortalama shell kuvvetleri
         logger.info("  Prediction H5 dosyasi kullaniliyor: %s", prediction_h5)
         pred_df = predict_from_h5(
-            per_shell_results=results_for_pred,
+            correlation_results=correlation_results,
             prediction_h5_path=prediction_h5,
             output_csv=csv_path,
+            connectivity=connectivity,
         )
     else:
-        # Mevcut OP2 verileriyle tahmin
+        # Mevcut OP2 verileriyle tahmin (correlation_results - ortalama shell)
         pred_df = predict_from_results(
-            per_shell_results=results_for_pred,
-            bar_forces=bar_forces,
-            shell_forces=shell_forces,
+            correlation_results=correlation_results,
             output_csv=csv_path,
         )
     logger.info("  %d tahmin satiri yazildi: %s", len(pred_df), csv_path)
