@@ -1611,6 +1611,15 @@ def read_coefficients_from_excel(excel_path: str) -> pd.DataFrame:
             f"Mevcut kolonlar: {list(df.columns)}"
         )
 
+    # Katsayi kolonlarini numerik yap (string/NaN temizligi)
+    numeric_cols = [
+        "Coeff_Bar_Axial", "Coeff_Shell_Nx", "Coeff_Shell_Ny",
+        "Coeff_Shell_Nxy", "Intercept",
+    ]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
     logger.info("  %d katsayi satiri okundu", len(df))
     return df
 
