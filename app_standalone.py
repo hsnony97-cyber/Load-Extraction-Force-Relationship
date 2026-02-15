@@ -1434,6 +1434,7 @@ _TARGET_COL_MAP = {
 # Cikti kolon sirasi
 _OUTPUT_COLUMNS = [
     "Bar_EID", "Element_Type", "Subcase_ID",
+    "Bar_Axial", "Shell_Nx", "Shell_Ny", "Shell_Nxy", "N_Shells_Used",
     "Pred_FX", "Pred_FY", "Pred_NX", "Pred_NY", "Pred_NXY",
 ]
 
@@ -1746,6 +1747,11 @@ def predict_from_results(
                 "Bar_EID": bar_eid,
                 "Element_Type": element_type,
                 "Subcase_ID": sc_id,
+                "Bar_Axial": float(X[i, 0]) if X.shape[1] > 0 else 0.0,
+                "Shell_Nx": float(X[i, 1]) if X.shape[1] > 1 else 0.0,
+                "Shell_Ny": float(X[i, 2]) if X.shape[1] > 2 else 0.0,
+                "Shell_Nxy": float(X[i, 3]) if X.shape[1] > 3 else 0.0,
+                "N_Shells_Used": res.n_connected_shells,
             }
             for eq in res.equations:
                 predicted = float(X[i] @ eq.coefficients + eq.intercept)
@@ -1859,10 +1865,17 @@ def _run_prediction(
 
             predictor = np.array([af, avg_nx, avg_ny, avg_nxy])
 
+            n_shells_used = len(shell_sc_data)
+
             row = {
                 "Bar_EID": int(bar_eid),
                 "Element_Type": int(et),
                 "Subcase_ID": int(sc_id),
+                "Bar_Axial": af,
+                "Shell_Nx": avg_nx,
+                "Shell_Ny": avg_ny,
+                "Shell_Nxy": avg_nxy,
+                "N_Shells_Used": n_shells_used,
             }
 
             for target_name, eq_info in eq_map.items():

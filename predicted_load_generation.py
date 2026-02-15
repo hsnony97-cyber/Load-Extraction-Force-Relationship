@@ -53,6 +53,7 @@ TARGET_COL_MAP = {
 
 OUTPUT_COLUMNS = [
     "Bar_EID", "Element_Type", "Subcase_ID",
+    "Bar_Axial", "Shell_Nx", "Shell_Ny", "Shell_Nxy", "N_Shells_Used",
     "Pred_FX", "Pred_FY", "Pred_NX", "Pred_NY", "Pred_NXY",
 ]
 
@@ -117,6 +118,16 @@ def read_coefficients(excel_path: str) -> pd.DataFrame:
 
     logger.info("  %d katsayi satiri, %d unique Bar_EID",
                 len(df), df["Bar_EID"].nunique())
+
+    # Debug: ilk katsayilari goster
+    if len(df) > 0:
+        sample = df.iloc[0]
+        logger.info("  Ornek katsayi: Bar_EID=%s, ET=%s, Target='%s'",
+                     sample.get("Bar_EID"), sample.get("Element_Type"), sample.get("Target"))
+        for c in COEFF_COLUMNS + ["Intercept"]:
+            if c in df.columns:
+                logger.info("    %s = %s (dtype: %s)", c, sample.get(c), type(sample.get(c)))
+
     return df
 
 
@@ -302,87 +313,158 @@ def generate_predictions(
     shell_eid_map: dict,
 ) -> pd.DataFrame:
     """
-    Predicted vs Actual mantigi ile birebir ayni tahmin.
+    Reporter _write_predicted_vs_actual ile BIREBIR ayni mantik.
 
-    Her (bar_eid, element_type, subcase) icin:
-      predictor = [AF, avg_NX, avg_NY, avg_NXY]
-      predicted = predictor @ [Coeff_Bar_Axial, Coeff_Shell_Nx, Coeff_Shell_Ny, Coeff_Shell_Nxy] + Intercept
+    Reporter'da:
+      X = np.column_stack([res.predictor_data[k][:n] for k in pred_names])
+      predicted_arr = X @ eq.coefficients + eq.intercept
+
+    Burada:
+      Her (bar_eid, element_type, subcase) icin:
+        X_row = [AF, avg_NX, avg_NY, avg_NXY]
+        predicted = X_row @ coefficients + intercept
+
+    CSV'ye predictor degerleri de yazilir (karsilastirma icin).
     """
     bar_df = _normalize_bar(bar_df)
     shell_df = _normalize_shell(shell_df)
 
-    logger.info("Tahmin: bar %d satir, shell %d satir, coeff %d satir, connectivity %d bar",
-                len(bar_df), len(shell_df), len(coeff_df), len(shell_eid_map))
+    logger.info("=" * 60)
+    logger.info("TAHMIN BASLADI")
+    logger.info("  Bar:   %d satir, kolonlar: %s", len(bar_df), list(bar_df.columns))
+    logger.info("  Shell: %d satir, kolonlar: %s", len(shell_df), list(shell_df.columns))
+    logger.info("  Coeff: %d satir", len(coeff_df))
+    logger.info("  Connectivity: %d bar element", len(shell_eid_map))
+
+    # Coeff gruplari
+    groups = coeff_df.groupby(["Bar_EID", "Element_Type"])
+    logger.info("  Coeff gruplari: %d (bar_eid, element_type)", len(groups))
 
     rows = []
-    groups = coeff_df.groupby(["Bar_EID", "Element_Type"])
+    first_logged = False
 
     for (bar_eid, et), grp in groups:
-        # Her target icin katsayilari hazirla
-        eq_map = {}
+        bar_eid_int = int(float(bar_eid))
+        et_int = int(float(et))
+
+        # --- Katsayilari hazirla (Reporter'daki eq.coefficients + eq.intercept) ---
+        eq_list = []
         for _, crow in grp.iterrows():
-            target = crow["Target"]
+            target = str(crow["Target"])
             coeffs = np.array([
-                crow.get("Coeff_Bar_Axial", 0.0),
-                crow.get("Coeff_Shell_Nx", 0.0),
-                crow.get("Coeff_Shell_Ny", 0.0),
-                crow.get("Coeff_Shell_Nxy", 0.0),
+                float(crow.get("Coeff_Bar_Axial", 0.0) or 0.0),
+                float(crow.get("Coeff_Shell_Nx", 0.0) or 0.0),
+                float(crow.get("Coeff_Shell_Ny", 0.0) or 0.0),
+                float(crow.get("Coeff_Shell_Nxy", 0.0) or 0.0),
             ], dtype=float)
-            intercept = float(crow.get("Intercept", 0.0))
-            eq_map[target] = (coeffs, intercept)
+            intercept = float(crow.get("Intercept", 0.0) or 0.0)
+            eq_list.append((target, coeffs, intercept))
 
-        # Bar AF verileri
-        bar_sub = bar_df[bar_df["bar_eid"] == int(bar_eid)]
+        # --- Bar AF verileri ---
+        bar_sub = bar_df[bar_df["bar_eid"] == bar_eid_int]
         if bar_sub.empty:
+            # float karsilastirma dene
+            bar_sub = bar_df[bar_df["bar_eid"] == float(bar_eid_int)]
+        if bar_sub.empty:
+            logger.warning("  Bar %d: H5'te bar verisi yok, atlaniyor", bar_eid_int)
             continue
 
-        # Bagli shell EID'leri
-        connected = shell_eid_map.get(int(bar_eid), [])
+        # --- Bagli shell EID'leri ---
+        connected = shell_eid_map.get(bar_eid_int, [])
         if not connected:
-            logger.debug("Bar %d: connectivity yok, atlaniyor", bar_eid)
+            logger.warning("  Bar %d: connectivity bos, atlaniyor", bar_eid_int)
             continue
 
-        # Her subcase icin
+        # N_Shells bilgisi (Correlation Summary'deki)
+        n_shells_coeff = int(grp.iloc[0].get("N_Shells", 0)) if "N_Shells" in grp.columns else 0
+
+        if not first_logged:
+            logger.info("--- ILK BAR DEBUG ---")
+            logger.info("  Bar_EID=%d, ET=%d", bar_eid_int, et_int)
+            logger.info("  Connected shells: %s", connected[:10])
+            logger.info("  N_Shells (Corr.Summary): %d, N_Shells (connectivity): %d",
+                        n_shells_coeff, len(connected))
+            for tgt, cf, ic in eq_list:
+                logger.info("  Target='%s': coeffs=%s, intercept=%.6f", tgt, cf, ic)
+
+        # --- Her subcase icin tahmin (Reporter mantigi) ---
         for _, brow in bar_sub.iterrows():
             sc_id = brow["subcase_id"]
             af = float(brow["af"])
 
             # Bagli shell'lerin bu subcase'teki ortalamasi
+            # Reporter: avg_shell_nx = np.mean([shell_nx for each connected shell])
             mask = (
                 shell_df["element_id"].isin(connected) &
                 (shell_df["subcase_id"] == sc_id)
             )
             sdata = shell_df[mask]
             if sdata.empty:
+                # Float/int tip uyumsuzlugu olabilir, toleransli dene
+                mask2 = (
+                    shell_df["element_id"].isin(connected) &
+                    (shell_df["subcase_id"].between(sc_id - 0.5, sc_id + 0.5))
+                )
+                sdata = shell_df[mask2]
+            if sdata.empty:
                 continue
 
+            n_shells_used = len(sdata)
             avg_nx = float(sdata["nx"].mean())
             avg_ny = float(sdata["ny"].mean())
             avg_nxy = float(sdata["nxy"].mean())
 
-            predictor = np.array([af, avg_nx, avg_ny, avg_nxy])
+            # Reporter: X_row = [Bar_Axial, Shell_Nx, Shell_Ny, Shell_Nxy]
+            X_row = np.array([af, avg_nx, avg_ny, avg_nxy])
 
             row = {
-                "Bar_EID": int(bar_eid),
-                "Element_Type": int(et),
-                "Subcase_ID": int(sc_id),
+                "Bar_EID": bar_eid_int,
+                "Element_Type": et_int,
+                "Subcase_ID": int(float(sc_id)),
+                "Bar_Axial": af,
+                "Shell_Nx": avg_nx,
+                "Shell_Ny": avg_ny,
+                "Shell_Nxy": avg_nxy,
+                "N_Shells_Used": n_shells_used,
             }
 
-            for target_name, (coeffs, intercept) in eq_map.items():
-                predicted = float(predictor @ coeffs + intercept)
+            if not first_logged:
+                logger.info("  Subcase=%d: AF=%.4f, avg_NX=%.4f, avg_NY=%.4f, avg_NXY=%.4f, n_shells=%d",
+                            int(float(sc_id)), af, avg_nx, avg_ny, avg_nxy, n_shells_used)
+
+            # Reporter: predicted_arr = X @ eq.coefficients + eq.intercept
+            for target, coeffs, intercept in eq_list:
+                predicted = float(X_row @ coeffs + intercept)
                 col_name = TARGET_COL_MAP.get(
-                    target_name,
-                    f"Pred_{target_name.replace(' ', '_')}"
+                    target,
+                    f"Pred_{target.replace(' ', '_')}"
                 )
                 row[col_name] = predicted
 
+                if not first_logged:
+                    logger.info("    %s: %.4f = [%.4f,%.4f,%.4f,%.4f] @ %s + %.4f",
+                                target, predicted, af, avg_nx, avg_ny, avg_nxy,
+                                coeffs, intercept)
+
             rows.append(row)
 
+            if not first_logged:
+                first_logged = True
+
+    logger.info("=" * 60)
+
     if not rows:
-        logger.warning("Hicbir tahmin uretilmedi")
+        logger.warning("Hicbir tahmin uretilmedi!")
+        logger.warning("  Olasi sebepler:")
+        logger.warning("  - Bar EID'ler H5 ile eslesmiyor")
+        logger.warning("  - Shell EID'ler H5 ile eslesmiyor")
+        logger.warning("  - Subcase ID'ler eslesmiyor")
         return pd.DataFrame(columns=OUTPUT_COLUMNS)
 
     df = pd.DataFrame(rows)
+    logger.info("Toplam %d tahmin satiri, %d unique bar, %d unique subcase",
+                len(df), df["Bar_EID"].nunique(), df["Subcase_ID"].nunique())
+
     present = [c for c in OUTPUT_COLUMNS if c in df.columns]
     extra = [c for c in df.columns if c not in OUTPUT_COLUMNS]
     return df[present + extra]
