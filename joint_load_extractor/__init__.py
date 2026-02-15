@@ -11,7 +11,7 @@ from joint_load_extractor.op2_reader import OP2Reader
 from joint_load_extractor.h5_reader import H5Reader
 from joint_load_extractor.correlation import CorrelationEngine
 from joint_load_extractor.reporter import ReportGenerator
-from joint_load_extractor.predictor import predict_from_results, predict_from_dataframes
+from joint_load_extractor.predictor import predict_from_results, predict_from_dataframes, predict_from_h5
 
 __version__ = "1.0.0"
 __all__ = [
@@ -22,4 +22,5 @@ __all__ = [
     "ReportGenerator",
     "predict_from_results",
     "predict_from_dataframes",
+    "predict_from_h5",
 ]

@@ -36,7 +36,7 @@ from joint_load_extractor.op2_reader import OP2Reader, BarForceResult, ShellForc
 from joint_load_extractor.h5_reader import H5Reader
 from joint_load_extractor.correlation import CorrelationEngine, JointCorrelationResult
 from joint_load_extractor.reporter import ReportGenerator
-from joint_load_extractor.predictor import predict_from_results
+from joint_load_extractor.predictor import predict_from_results, predict_from_h5
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -560,6 +560,10 @@ Ornek kullanim:
         help="H5 dosyasindaki Joint Load Cap tablosunun yolu (ornek: 'JOINT_LOADS_CAP/table')",
     )
     parser.add_argument(
+        "--prediction-h5", default=None,
+        help="Tahmin icin ayri H5 dosyasi (bar element combined + shell force combined)",
+    )
+    parser.add_argument(
         "-v", "--verbose", action="store_true",
         help="Detayli cikti",
     )
@@ -720,12 +724,24 @@ Ornek kullanim:
 
     csv_path = str(Path(args.output).with_suffix(".csv"))
     results_for_pred = per_shell_results if per_shell_results else correlation_results
-    pred_df = predict_from_results(
-        per_shell_results=results_for_pred,
-        bar_forces=bar_forces,
-        shell_forces=shell_forces,
-        output_csv=csv_path,
-    )
+
+    prediction_h5 = getattr(args, "prediction_h5", None)
+    if prediction_h5:
+        # Ayri Prediction H5 dosyasindan oku
+        logger.info("  Prediction H5 dosyasi kullaniliyor: %s", prediction_h5)
+        pred_df = predict_from_h5(
+            per_shell_results=results_for_pred,
+            prediction_h5_path=prediction_h5,
+            output_csv=csv_path,
+        )
+    else:
+        # Mevcut OP2 verileriyle tahmin
+        pred_df = predict_from_results(
+            per_shell_results=results_for_pred,
+            bar_forces=bar_forces,
+            shell_forces=shell_forces,
+            output_csv=csv_path,
+        )
     logger.info("  %d tahmin satiri yazildi: %s", len(pred_df), csv_path)
 
     elapsed = time.time() - start_time
