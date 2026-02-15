@@ -1612,13 +1612,21 @@ def read_coefficients_from_excel(excel_path: str) -> pd.DataFrame:
         )
 
     # Katsayi kolonlarini numerik yap (string/NaN temizligi)
+    # Reporter startrow=1 ile yazdigi icin ilk satir tekrar kolon isimleri olabilir
     numeric_cols = [
         "Coeff_Bar_Axial", "Coeff_Shell_Nx", "Coeff_Shell_Ny",
         "Coeff_Shell_Nxy", "Intercept",
     ]
     for col in numeric_cols:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    for col in ["Bar_EID", "Element_Type"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["Bar_EID"])
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = df[col].fillna(0.0)
 
     logger.info("  %d katsayi satiri okundu", len(df))
     return df
@@ -1634,10 +1642,14 @@ def _extract_connectivity_from_excel(excel_path: str) -> Dict[int, List[int]]:
         if candidate in xls.sheet_names:
             df = pd.read_excel(excel_path, sheet_name=candidate)
             if "Bar_EID" in df.columns and "Shell_EID" in df.columns:
+                # Numerik temizlik (startrow=1 duplicate header sorunu)
+                df["Bar_EID"] = pd.to_numeric(df["Bar_EID"], errors="coerce")
+                df["Shell_EID"] = pd.to_numeric(df["Shell_EID"], errors="coerce")
+                df = df.dropna(subset=["Bar_EID", "Shell_EID"])
+
                 shell_map = {}
                 for bar_eid, group in df.groupby("Bar_EID"):
-                    shell_eids = group["Shell_EID"].dropna()
-                    shell_eids = [int(s) for s in shell_eids if str(s).strip() and str(s).strip() != ""]
+                    shell_eids = [int(s) for s in group["Shell_EID"].dropna()]
                     if shell_eids:
                         shell_map[int(bar_eid)] = list(set(shell_eids))
                 logger.info("  %d bar element icin connectivity bulundu", len(shell_map))

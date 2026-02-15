@@ -101,10 +101,19 @@ def read_coefficients(excel_path: str) -> pd.DataFrame:
     if missing:
         raise ValueError(f"Eksik kolonlar: {missing}. Mevcut: {list(df.columns)}")
 
-    # Katsayi kolonlarini numerik yap (string/NaN temizligi)
+    # Numerik temizlik: Reporter startrow=1 ile yazdigi icin
+    # ilk satir tekrar kolon isimleri olabilir (string row)
     for col in COEFF_COLUMNS + ["Intercept"]:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    for col in ["Bar_EID", "Element_Type"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    # String satirlari at (Bar_EID NaN olanlari)
+    df = df.dropna(subset=["Bar_EID"])
+    for col in COEFF_COLUMNS + ["Intercept"]:
+        if col in df.columns:
+            df[col] = df[col].fillna(0.0)
 
     logger.info("  %d katsayi satiri, %d unique Bar_EID",
                 len(df), df["Bar_EID"].nunique())
@@ -121,10 +130,13 @@ def read_connectivity(excel_path: str) -> dict:
     if "Total Summary" in xls.sheet_names:
         df = pd.read_excel(excel_path, sheet_name="Total Summary")
         if "Bar_EID" in df.columns and "Shell_EID" in df.columns:
+            # Numerik temizlik (startrow=1 duplicate header sorunu)
+            df["Bar_EID"] = pd.to_numeric(df["Bar_EID"], errors="coerce")
+            df["Shell_EID"] = pd.to_numeric(df["Shell_EID"], errors="coerce")
+            df = df.dropna(subset=["Bar_EID", "Shell_EID"])
+
             for bar_eid, grp in df.groupby("Bar_EID"):
-                eids = grp["Shell_EID"].dropna()
-                eids = [int(e) for e in eids
-                        if str(e).strip() and str(e).strip() != ""]
+                eids = [int(e) for e in grp["Shell_EID"].dropna()]
                 if eids:
                     shell_map[int(bar_eid)] = list(set(eids))
             logger.info("  Connectivity: %d bar element", len(shell_map))
