@@ -1155,58 +1155,33 @@ class ReportGenerator:
         header_fmt, number_fmt, int_fmt, border_fmt,
     ):
         """
-        Total Summary sheet'i - per-shell bazinda tum bar elementler icin tek tablo.
+        Total Summary sheet'i - long format.
 
-        Per-shell sonuclari varsa (shell_eid != None), her satir bir
-        (Bar_EID, Shell_EID, Shell_Type, Element_Type) kombinasyonu.
+        Her hedef (target) icin ayri satir.
+        Kolonlar:
+          Bar_EID | Element_Type | Subcase_ID | Shell_EID | Shell_Type |
+          Target | Coeff_Bar_Axial | Coeff_Shell_Nx | Coeff_Shell_Ny |
+          Coeff_Shell_Nxy | Intercept | R2
         """
         logger = logging.getLogger(__name__)
-        target_short = {
-            "F Bearing X": "FBX",
-            "F Bearing Y": "FBY",
-            "NX Bypass": "NX_Byp",
-            "NY Bypass": "NY_Byp",
-            "NXY Bypass": "NXY_Byp",
-        }
-
         rows = []
         for res in correlation_results:
-            row = {
+            base = {
                 "Bar_EID": res.bar_eid,
+                "Element_Type": res.element_type,
+                "Subcase_ID": res.subcase_id,
                 "Shell_EID": res.shell_eid if res.shell_eid is not None else "",
                 "Shell_Type": res.shell_type if res.shell_type is not None else "",
-                "Element_Type": res.element_type,
-                "N_Shells": res.n_connected_shells,
-                "N_Subcases": len(res.matched_subcases) if res.matched_subcases else 0,
             }
 
-            info = connectivity.get(res.bar_eid)
-            if info:
-                row["Node_A"] = info.node_a
-                row["Node_B"] = info.node_b
-            else:
-                row["Node_A"] = ""
-                row["Node_B"] = ""
-
-            eq_map = {eq.target_name: eq for eq in res.equations}
-            for target_name, short in target_short.items():
-                eq = eq_map.get(target_name)
-                if eq is not None:
-                    row[f"Coeff_Bar_Axial_{short}"] = float(eq.coefficients[0])
-                    row[f"Coeff_Shell_Nx_{short}"] = float(eq.coefficients[1])
-                    row[f"Coeff_Shell_Ny_{short}"] = float(eq.coefficients[2])
-                    row[f"Coeff_Shell_Nxy_{short}"] = float(eq.coefficients[3])
-                    row[f"Intercept_{short}"] = float(eq.intercept)
-                    row[f"R2_{short}"] = eq.r_squared
-                else:
-                    row[f"Coeff_Bar_Axial_{short}"] = ""
-                    row[f"Coeff_Shell_Nx_{short}"] = ""
-                    row[f"Coeff_Shell_Ny_{short}"] = ""
-                    row[f"Coeff_Shell_Nxy_{short}"] = ""
-                    row[f"Intercept_{short}"] = ""
-                    row[f"R2_{short}"] = ""
-
-            rows.append(row)
+            for eq in res.equations:
+                row = dict(base)
+                row["Target"] = eq.target_name
+                for pname, coeff in zip(eq.predictor_names, eq.coefficients):
+                    row[f"Coeff_{pname}"] = float(coeff)
+                row["Intercept"] = float(eq.intercept)
+                row["R2"] = eq.r_squared
+                rows.append(row)
 
         if not rows:
             logger.info("Total Summary: veri yok, sheet atlaniyor")
@@ -1220,14 +1195,26 @@ class ReportGenerator:
         for col_idx, col_name in enumerate(df.columns):
             ws.write(0, col_idx, col_name, header_fmt)
 
-        ws.set_column(0, 0, 12)   # Bar_EID
-        ws.set_column(1, 1, 12)   # Shell_EID
-        ws.set_column(2, 2, 10)   # Shell_Type
-        ws.set_column(3, 3, 12)   # Element_Type
-        ws.set_column(4, 5, 10)   # N_Shells, N_Subcases
-        ws.set_column(6, 7, 10)   # Node_A, Node_B
-        ws.set_column(8, len(df.columns) - 1, 18)
+        # Kolon genislikleri
+        col_widths = {
+            "Bar_EID": 12,
+            "Element_Type": 12,
+            "Subcase_ID": 12,
+            "Shell_EID": 12,
+            "Shell_Type": 10,
+            "Target": 16,
+            "Coeff_Bar_Axial": 16,
+            "Coeff_Shell_Nx": 16,
+            "Coeff_Shell_Ny": 16,
+            "Coeff_Shell_Nxy": 16,
+            "Intercept": 14,
+            "R2": 10,
+        }
+        for col_idx, col_name in enumerate(df.columns):
+            width = col_widths.get(col_name, 14)
+            ws.set_column(col_idx, col_idx, width)
 
+        # R² renklendirme
         good_r2_fmt = workbook.add_format({
             "num_format": "0.0000", "border": 1, "bg_color": self.CORR_POS_COLOR,
         })
@@ -1235,18 +1222,17 @@ class ReportGenerator:
             "num_format": "0.0000", "border": 1, "bg_color": self.CORR_NEG_COLOR,
         })
 
-        r2_cols = [col for col in df.columns if col.startswith("R2_")]
-        for r2_col in r2_cols:
-            col_idx = list(df.columns).index(r2_col)
-            for row_idx, row_data in enumerate(rows):
-                val = row_data.get(r2_col, "")
-                if isinstance(val, (int, float)):
-                    fmt = good_r2_fmt if val >= 0.7 else bad_r2_fmt
-                    ws.write(row_idx + 1, col_idx, val, fmt)
+        r2_col_idx = list(df.columns).index("R2")
+        for row_idx, row_data in enumerate(rows):
+            val = row_data.get("R2", "")
+            if isinstance(val, (int, float)):
+                fmt = good_r2_fmt if val >= 0.7 else bad_r2_fmt
+                ws.write(row_idx + 1, r2_col_idx, val, fmt)
 
-        ws.freeze_panes(1, 3)
+        # Freeze panes: baslik satiri ve ilk 4 kolon sabit
+        ws.freeze_panes(1, 4)
 
-        logger.info("Total Summary: %d satir yazildi (per-shell)", len(rows))
+        logger.info("Total Summary: %d satir yazildi", len(rows))
 
     def _write_predicted_vs_actual(
         self, writer, workbook, correlation_results,
