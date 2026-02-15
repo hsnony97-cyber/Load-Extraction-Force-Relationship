@@ -1,19 +1,24 @@
 """
 Predictor Module
 
-Korelasyon analizinden elde edilen katsayilari kullanarak
-yeni veriler (ayri bir Prediction H5 dosyasindan) icin
+Korelasyon analizinden elde edilen katsayilari (Correlation Summary Excel)
+ve yeni veriler (Prediction H5) kullanarak
 Bearing ve Bypass yuklerini tahmin eder.
 
 Prediction H5 yapisi:
-  - Bar element combined tablosu: Bar_EID, Subcase_ID, AF (Axial Force)
-  - Shell force combined tablosu: Element_ID, Subcase_ID, NX(=MX), NY(=MY), NXY(=MXY)
+  - ELFORCE_BAR_COMBINED/table:   Element_ID, Subcase_ID, AF
+  - ELFORCE_SHELL_COMBINED/table: Element_ID, Subcase_ID, MX(=NX), MY(=NY), MXY(=NXY)
 
-Cikti:
-  CSV dosyasi: Bar_EID, Element_Type, Subcase_ID, Shell_EID,
-               AF, NX, NY, NXY,
-               Pred_F_Bearing_X, Pred_F_Bearing_Y,
-               Pred_NX_Bypass, Pred_NY_Bypass, Pred_NXY_Bypass
+Correlation Summary Excel (Total Summary sheet):
+  Bar_EID | Element_Type | Subcase_ID | Shell_EID | Shell_Type |
+  Target | Coeff_Bar_Axial | Coeff_Shell_Nx | Coeff_Shell_Ny |
+  Coeff_Shell_Nxy | Intercept | R2
+
+Cikti CSV:
+  Bar_EID, Element_Type, Subcase_ID, Shell_EID,
+  AF, NX, NY, NXY,
+  Pred_F_Bearing_X, Pred_F_Bearing_Y,
+  Pred_NX_Bypass, Pred_NY_Bypass, Pred_NXY_Bypass
 """
 
 import logging
@@ -27,6 +32,10 @@ from joint_load_extractor.correlation import JointCorrelationResult, RegressionE
 
 logger = logging.getLogger(__name__)
 
+# Prediction H5 sabit tablo yollari
+BAR_TABLE_PATH = "ELFORCE_BAR_COMBINED/table"
+SHELL_TABLE_PATH = "ELFORCE_SHELL_COMBINED/table"
+
 
 # ============================================================
 #  Prediction H5 Reader
@@ -37,19 +46,16 @@ def read_prediction_h5(h5_path: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Prediction H5 dosyasini oku.
 
-    H5 icinde iki tablo aranir:
-      1. Bar element combined (AF / Axial Force iceren)
-      2. Shell force combined (NX/MX, NY/MY, NXY/MXY iceren)
+    Sabit yollar:
+      - ELFORCE_BAR_COMBINED/table  -> Element_ID, Subcase_ID, AF
+      - ELFORCE_SHELL_COMBINED/table -> Element_ID, Subcase_ID, MX, MY, MXY
 
-    Parameters
-    ----------
-    h5_path : str
-        Prediction H5 dosya yolu.
+    MX->NX, MY->NY, MXY->NXY olarak yeniden adlandirilir.
 
     Returns
     -------
     Tuple[pd.DataFrame, pd.DataFrame]
-        (bar_forces_df, shell_forces_df)
+        (bar_forces_df, shell_forces_df) - normalize edilmis kolonlarla
     """
     logger.info("Prediction H5 okunuyor: %s", h5_path)
 
@@ -57,91 +63,40 @@ def read_prediction_h5(h5_path: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     shell_df = pd.DataFrame()
 
     with h5py.File(h5_path, "r") as f:
-        # Tum dataset'leri tara
-        datasets = {}
-        _collect_datasets(f, datasets)
-
-        logger.info("H5 icerisinde %d dataset bulundu", len(datasets))
-        for path, cols in datasets.items():
-            logger.info("  %s: %s", path, cols[:10])
-
-        # Bar element combined tablosunu bul
-        bar_path = _find_bar_table(datasets)
-        if bar_path:
-            bar_df = _read_h5_table(f, bar_path)
-            logger.info("Bar element tablosu bulundu: %s (%d satir)", bar_path, len(bar_df))
+        # --- Bar element combined ---
+        if BAR_TABLE_PATH in f:
+            bar_df = _read_h5_table(f, BAR_TABLE_PATH)
+            # Element_ID -> Bar_EID
+            if "Element_ID" in bar_df.columns:
+                bar_df = bar_df.rename(columns={"Element_ID": "Bar_EID"})
+            logger.info("Bar tablosu okundu: %s (%d satir, kolonlar: %s)",
+                       BAR_TABLE_PATH, len(bar_df), list(bar_df.columns))
         else:
-            logger.warning("Prediction H5'te bar element tablosu bulunamadi")
+            logger.warning("Prediction H5'te '%s' bulunamadi", BAR_TABLE_PATH)
+            # Mevcut tum dataset'leri listele
+            _log_h5_structure(f)
 
-        # Shell force combined tablosunu bul
-        shell_path = _find_shell_table(datasets)
-        if shell_path:
-            shell_df = _read_h5_table(f, shell_path)
-            logger.info("Shell force tablosu bulundu: %s (%d satir)", shell_path, len(shell_df))
+        # --- Shell force combined ---
+        if SHELL_TABLE_PATH in f:
+            shell_df = _read_h5_table(f, SHELL_TABLE_PATH)
+            # Element_ID -> Shell_EID, MX->NX, MY->NY, MXY->NXY
+            rename_map = {}
+            if "Element_ID" in shell_df.columns:
+                rename_map["Element_ID"] = "Shell_EID"
+            if "MX" in shell_df.columns:
+                rename_map["MX"] = "NX"
+            if "MY" in shell_df.columns:
+                rename_map["MY"] = "NY"
+            if "MXY" in shell_df.columns:
+                rename_map["MXY"] = "NXY"
+            shell_df = shell_df.rename(columns=rename_map)
+            logger.info("Shell tablosu okundu: %s (%d satir, kolonlar: %s)",
+                       SHELL_TABLE_PATH, len(shell_df), list(shell_df.columns))
         else:
-            logger.warning("Prediction H5'te shell force tablosu bulunamadi")
+            logger.warning("Prediction H5'te '%s' bulunamadi", SHELL_TABLE_PATH)
+            _log_h5_structure(f)
 
     return bar_df, shell_df
-
-
-def _collect_datasets(group, result: Dict, prefix: str = ""):
-    """H5 grup icerisindeki tum dataset'leri recursive topla."""
-    for key in group:
-        path = f"{prefix}/{key}" if prefix else key
-        item = group[key]
-        if isinstance(item, h5py.Group):
-            _collect_datasets(item, result, path)
-        elif isinstance(item, h5py.Dataset):
-            if item.dtype.names:
-                result[path] = list(item.dtype.names)
-            else:
-                result[path] = []
-
-
-def _find_bar_table(datasets: Dict[str, List[str]]) -> Optional[str]:
-    """Bar element combined tablosunu bul (AF kolonu iceren)."""
-    for path, cols in datasets.items():
-        cols_lower = [c.lower().replace(" ", "").replace("_", "") for c in cols]
-        path_lower = path.lower()
-
-        # AF veya AxialForce kolonu olan tabloyu bul
-        has_af = any(c in ("af", "axialforce", "baraxial", "axial") for c in cols_lower)
-        # "bar" kelimesi path veya kolon isimlerinde
-        has_bar_hint = "bar" in path_lower or any("bar" in c for c in cols_lower)
-
-        if has_af:
-            return path
-        if has_bar_hint and len(cols) > 0:
-            # AF kolonu olmasa bile bar tablosu olabilir
-            continue
-
-    # Fallback: path'te "bar" gecen ilk dataset
-    for path, cols in datasets.items():
-        if "bar" in path.lower() and cols:
-            return path
-
-    return None
-
-
-def _find_shell_table(datasets: Dict[str, List[str]]) -> Optional[str]:
-    """Shell force combined tablosunu bul (NX/MX kolonu iceren)."""
-    for path, cols in datasets.items():
-        cols_lower = [c.lower().replace(" ", "").replace("_", "") for c in cols]
-        path_lower = path.lower()
-
-        # NX/MX kolonu olan tabloyu bul
-        has_nx = any(c in ("nx", "mx", "membranex", "shellnx") for c in cols_lower)
-        has_shell_hint = "shell" in path_lower or any("shell" in c for c in cols_lower)
-
-        if has_nx:
-            return path
-
-    # Fallback: path'te "shell" gecen ilk dataset
-    for path, cols in datasets.items():
-        if "shell" in path.lower() and cols:
-            return path
-
-    return None
 
 
 def _read_h5_table(f: h5py.File, path: str) -> pd.DataFrame:
@@ -163,6 +118,86 @@ def _read_h5_table(f: h5py.File, path: str) -> pd.DataFrame:
     return pd.DataFrame(dataset[:])
 
 
+def _log_h5_structure(f: h5py.File):
+    """H5 dosyasindaki tum gruplari/dataset'leri logla."""
+    paths = []
+
+    def _collect(group, prefix=""):
+        for key in group:
+            path = f"{prefix}/{key}" if prefix else key
+            item = group[key]
+            if isinstance(item, h5py.Group):
+                _collect(item, path)
+            elif isinstance(item, h5py.Dataset):
+                cols = list(item.dtype.names) if item.dtype.names else []
+                paths.append((path, cols))
+
+    _collect(f)
+    logger.info("H5 yapisi (%d dataset):", len(paths))
+    for path, cols in paths:
+        logger.info("  %s: %s", path, cols[:10])
+
+
+# ============================================================
+#  Coefficient Reader (Excel Total Summary)
+# ============================================================
+
+
+def read_coefficients_from_excel(excel_path: str) -> pd.DataFrame:
+    """
+    Correlation Summary Excel dosyasindaki 'Total Summary' sheet'ini oku.
+
+    Beklenen kolonlar:
+      Bar_EID, Element_Type, Subcase_ID, Shell_EID, Shell_Type,
+      Target, Coeff_Bar_Axial, Coeff_Shell_Nx, Coeff_Shell_Ny,
+      Coeff_Shell_Nxy, Intercept, R2
+
+    Returns
+    -------
+    pd.DataFrame
+        Katsayi tablosu.
+    """
+    logger.info("Katsayilar Excel'den okunuyor: %s", excel_path)
+
+    try:
+        df = pd.read_excel(excel_path, sheet_name="Total Summary")
+    except ValueError:
+        # Sheet adi farkli olabilir
+        xls = pd.ExcelFile(excel_path)
+        logger.info("Excel sheet'leri: %s", xls.sheet_names)
+        # 'Total Summary' veya 'Summary' iceren ilk sheet'i bul
+        found = None
+        for name in xls.sheet_names:
+            if "total" in name.lower() and "summary" in name.lower():
+                found = name
+                break
+        if found is None:
+            for name in xls.sheet_names:
+                if "summary" in name.lower():
+                    found = name
+                    break
+        if found is None:
+            raise ValueError(
+                f"Excel dosyasinda 'Total Summary' sheet'i bulunamadi. "
+                f"Mevcut sheet'ler: {xls.sheet_names}"
+            )
+        df = pd.read_excel(excel_path, sheet_name=found)
+        logger.info("'%s' sheet'i kullanildi", found)
+
+    required = ["Bar_EID", "Element_Type", "Shell_EID", "Target", "Intercept"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Total Summary'de eksik kolonlar: {missing}. "
+            f"Mevcut kolonlar: {list(df.columns)}"
+        )
+
+    logger.info("  %d katsayi satiri okundu", len(df))
+    logger.info("  Unique Bar_EID: %d, Shell_EID: %d",
+               df["Bar_EID"].nunique(), df["Shell_EID"].nunique())
+    return df
+
+
 # ============================================================
 #  Prediction Functions
 # ============================================================
@@ -174,21 +209,10 @@ def predict_from_h5(
     output_csv: str,
 ) -> pd.DataFrame:
     """
-    Ayri bir Prediction H5 dosyasindan veri okuyup tahmin yap.
+    In-memory korelasyon sonuclari + Prediction H5 -> tahmin CSV.
 
-    Parameters
-    ----------
-    per_shell_results : List[JointCorrelationResult]
-        Per-shell korelasyon sonuclari (katsayilar icin).
-    prediction_h5_path : str
-        Prediction H5 dosya yolu (bar + shell force combined).
-    output_csv : str
-        Cikti CSV dosya yolu.
-
-    Returns
-    -------
-    pd.DataFrame
-        Tahmin sonuclari.
+    Analiz tamamlandiktan hemen sonra cagirilir.
+    Katsayilar hafizadaki per_shell_results'tan alinir.
     """
     bar_df, shell_df = read_prediction_h5(prediction_h5_path)
 
@@ -199,7 +223,7 @@ def predict_from_h5(
         logger.error("Prediction H5'te shell force verisi bulunamadi")
         return pd.DataFrame()
 
-    # Total Summary formati olustur (katsayilar)
+    # In-memory sonuclardan katsayi tablosu olustur
     coeff_rows = []
     for res in per_shell_results:
         if not res.equations:
@@ -221,13 +245,40 @@ def predict_from_h5(
         return pd.DataFrame()
 
     coeff_df = pd.DataFrame(coeff_rows)
+    return _run_prediction(coeff_df, bar_df, shell_df, output_csv)
 
-    return predict_from_dataframes(
-        coefficients_df=coeff_df,
-        bar_forces_df=bar_df,
-        shell_forces_df=shell_df,
-        output_csv=output_csv,
-    )
+
+def predict_from_excel_and_h5(
+    coefficients_excel: str,
+    prediction_h5_path: str,
+    output_csv: str,
+) -> pd.DataFrame:
+    """
+    Bagimsiz tahmin: Correlation Summary Excel + Prediction H5 -> CSV.
+
+    Onceki analizden tamamen bagimsiz calisir.
+    Excel'den katsayilari, H5'ten bar/shell kuvvetlerini okur.
+
+    Parameters
+    ----------
+    coefficients_excel : str
+        Correlation Summary Excel dosyasi (Total Summary sheet'i iceren).
+    prediction_h5_path : str
+        Prediction H5 dosyasi (ELFORCE_BAR_COMBINED + ELFORCE_SHELL_COMBINED).
+    output_csv : str
+        Cikti CSV dosya yolu.
+    """
+    coeff_df = read_coefficients_from_excel(coefficients_excel)
+    bar_df, shell_df = read_prediction_h5(prediction_h5_path)
+
+    if bar_df.empty:
+        logger.error("Prediction H5'te bar element verisi bulunamadi")
+        return pd.DataFrame()
+    if shell_df.empty:
+        logger.error("Prediction H5'te shell force verisi bulunamadi")
+        return pd.DataFrame()
+
+    return _run_prediction(coeff_df, bar_df, shell_df, output_csv)
 
 
 def predict_from_results(
@@ -238,20 +289,16 @@ def predict_from_results(
 ) -> pd.DataFrame:
     """
     Mevcut OP2 verileri ve korelasyon katsayilari ile tahmin yap.
-
-    Her (bar_eid, shell_eid, element_type, subcase) icin
-    predictor degerlerini alir ve regression denklemini uygular.
+    (Prediction H5 verilmediginde kullanilan fallback.)
     """
     rows = []
 
     for res in per_shell_results:
         if not res.equations:
             continue
-
         bar_eid = res.bar_eid
         shell_eid = res.shell_eid
         element_type = res.element_type
-
         if shell_eid is None:
             continue
 
@@ -276,25 +323,19 @@ def predict_from_results(
                 "Element_Type": element_type,
                 "Subcase_ID": sc_id,
                 "Shell_EID": shell_eid,
-                "AF": af,
-                "NX": nx,
-                "NY": ny,
-                "NXY": nxy,
+                "AF": af, "NX": nx, "NY": ny, "NXY": nxy,
             }
-
             predictors = np.array([af, nx, ny, nxy])
             for target_name, eq in eq_map.items():
                 pred_val = float(np.dot(eq.coefficients, predictors) + eq.intercept)
                 row[_target_to_col(target_name)] = pred_val
-
             rows.append(row)
 
     if not rows:
         logger.warning("Tahmin icin veri bulunamadi")
         return pd.DataFrame()
 
-    df = pd.DataFrame(rows)
-    df = _order_columns(df)
+    df = _order_columns(pd.DataFrame(rows))
     df.to_csv(output_csv, index=False)
     logger.info("Tahmin CSV yazildi: %s (%d satir)", output_csv, len(df))
     return df
@@ -306,31 +347,39 @@ def predict_from_dataframes(
     shell_forces_df: pd.DataFrame,
     output_csv: str,
 ) -> pd.DataFrame:
-    """
-    DataFrame formatindaki verilerle tahmin yap.
-
-    Parameters
-    ----------
-    coefficients_df : pd.DataFrame
-        Katsayi tablosu:
-        Bar_EID | Element_Type | Shell_EID |
-        Target | Coeff_Bar_Axial | Coeff_Shell_Nx | Coeff_Shell_Ny |
-        Coeff_Shell_Nxy | Intercept
-    bar_forces_df : pd.DataFrame
-        Bar element combined: Bar_EID, Subcase_ID, AF
-    shell_forces_df : pd.DataFrame
-        Shell force combined: Element_ID, Subcase_ID, NX, NY, NXY
-    output_csv : str
-        Cikti CSV dosya yolu.
-    """
+    """DataFrame formatindaki verilerle tahmin yap (eski uyumluluk)."""
     bar_df = _normalize_bar_df(bar_forces_df)
     shell_df = _normalize_shell_df(shell_forces_df)
-    coeff_df = coefficients_df.copy()
+    return _run_prediction(coefficients_df, bar_df, shell_df, output_csv)
 
-    logger.info("Prediction: bar_df %d satir, shell_df %d satir, coeff %d satir",
+
+# ============================================================
+#  Core Prediction Engine
+# ============================================================
+
+
+def _run_prediction(
+    coeff_df: pd.DataFrame,
+    bar_df: pd.DataFrame,
+    shell_df: pd.DataFrame,
+    output_csv: str,
+) -> pd.DataFrame:
+    """
+    Katsayilar + bar/shell kuvvetleri -> tahmin CSV.
+
+    coeff_df: Bar_EID, Element_Type, Shell_EID, Target, Coeff_*, Intercept
+    bar_df:   Bar_EID (veya bar_eid), Subcase_ID, AF
+    shell_df: Shell_EID (veya element_id), Subcase_ID, NX, NY, NXY
+    """
+    # Kolon isimlerini normalize et
+    bar_df = _normalize_bar_df(bar_df)
+    shell_df = _normalize_shell_df(shell_df)
+
+    logger.info("Prediction engine: bar %d satir, shell %d satir, coeff %d satir",
                 len(bar_df), len(shell_df), len(coeff_df))
-    logger.info("Bar kolonlar: %s", list(bar_df.columns))
-    logger.info("Shell kolonlar: %s", list(shell_df.columns))
+    logger.info("  Bar kolonlar: %s", list(bar_df.columns))
+    logger.info("  Shell kolonlar: %s", list(shell_df.columns))
+    logger.info("  Coeff kolonlar: %s", list(coeff_df.columns))
 
     rows = []
 
@@ -381,10 +430,7 @@ def predict_from_dataframes(
                 "Element_Type": int(et),
                 "Subcase_ID": int(sc_id),
                 "Shell_EID": int(shell_eid),
-                "AF": af,
-                "NX": nx,
-                "NY": ny,
-                "NXY": nxy,
+                "AF": af, "NX": nx, "NY": ny, "NXY": nxy,
             }
 
             predictors = np.array([af, nx, ny, nxy])
@@ -398,8 +444,7 @@ def predict_from_dataframes(
         logger.warning("Tahmin icin eslesen veri bulunamadi")
         return pd.DataFrame()
 
-    df = pd.DataFrame(rows)
-    df = _order_columns(df)
+    df = _order_columns(pd.DataFrame(rows))
     df.to_csv(output_csv, index=False)
     logger.info("Tahmin CSV yazildi: %s (%d satir)", output_csv, len(df))
     return df
@@ -440,7 +485,7 @@ def _normalize_bar_df(df: pd.DataFrame) -> pd.DataFrame:
     col_map = {}
     for col in df.columns:
         lower = col.lower().replace(" ", "_").replace("-", "_")
-        if lower in ("bar_eid", "bar_element_id", "bareid", "bar_id"):
+        if lower in ("bar_eid", "bar_element_id", "bareid", "bar_id", "element_id"):
             col_map[col] = "bar_eid"
         elif lower in ("subcase_id", "subcaseid", "subcase", "sc_id"):
             col_map[col] = "subcase_id"

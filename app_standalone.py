@@ -1418,6 +1418,10 @@ class ReportGenerator:
 #  Predictor
 # ============================================================
 
+# Prediction H5 sabit tablo yollari
+_BAR_TABLE_PATH = "ELFORCE_BAR_COMBINED/table"
+_SHELL_TABLE_PATH = "ELFORCE_SHELL_COMBINED/table"
+
 
 def _pred_target_to_col(target_name: str) -> str:
     """Hedef ismini tahmin kolon ismine donustur."""
@@ -1450,7 +1454,7 @@ def _pred_normalize_bar_df(df: pd.DataFrame) -> pd.DataFrame:
     col_map = {}
     for col in df.columns:
         lower = col.lower().replace(" ", "_").replace("-", "_")
-        if lower in ("bar_eid", "bar_element_id", "bareid", "bar_id"):
+        if lower in ("bar_eid", "bar_element_id", "bareid", "bar_id", "element_id"):
             col_map[col] = "bar_eid"
         elif lower in ("subcase_id", "subcaseid", "subcase", "sc_id"):
             col_map[col] = "subcase_id"
@@ -1488,10 +1492,35 @@ def _pred_normalize_shell_df(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
+def _read_h5_table(f, ds_path: str) -> pd.DataFrame:
+    """H5 dataset'ini DataFrame'e cevir."""
+    dataset = f[ds_path]
+    if dataset.dtype.names:
+        data = {}
+        for col_name in dataset.dtype.names:
+            col_data = dataset[col_name]
+            if col_data.dtype.kind in ("S", "O"):
+                try:
+                    col_data = np.array(
+                        [x.decode("utf-8") if isinstance(x, bytes) else x for x in col_data]
+                    )
+                except (UnicodeDecodeError, AttributeError):
+                    pass
+            data[col_name] = col_data
+        return pd.DataFrame(data)
+    return pd.DataFrame(dataset[:])
+
+
 def read_prediction_h5(h5_path: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Prediction H5 dosyasini oku.
-    Bar element combined + Shell force combined tablolarini dondurur.
+
+    Sabit yollar:
+      - ELFORCE_BAR_COMBINED/table  -> Element_ID, Subcase_ID, AF
+      - ELFORCE_SHELL_COMBINED/table -> Element_ID, Subcase_ID, MX, MY, MXY
+
+    MX->NX, MY->NY, MXY->NXY olarak yeniden adlandirilir.
+    Element_ID -> Bar_EID (bar), Shell_EID (shell).
     """
     logger = logging.getLogger(__name__)
     logger.info("Prediction H5 okunuyor: %s", h5_path)
@@ -1500,86 +1529,93 @@ def read_prediction_h5(h5_path: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     shell_df = pd.DataFrame()
 
     with h5py.File(h5_path, "r") as f:
-        datasets = {}
-
-        def _collect(group, prefix=""):
-            for key in group:
-                path = f"{prefix}/{key}" if prefix else key
-                item = group[key]
-                if isinstance(item, h5py.Group):
-                    _collect(item, path)
-                elif isinstance(item, h5py.Dataset):
-                    if item.dtype.names:
-                        datasets[path] = list(item.dtype.names)
-                    else:
-                        datasets[path] = []
-
-        _collect(f)
-        logger.info("H5 icerisinde %d dataset bulundu", len(datasets))
-        for path, cols in datasets.items():
-            logger.info("  %s: %s", path, cols[:10])
-
-        # Bar element tablosunu bul (AF kolonu iceren)
-        bar_path = None
-        for path, cols in datasets.items():
-            cols_lower = [c.lower().replace(" ", "").replace("_", "") for c in cols]
-            if any(c in ("af", "axialforce", "baraxial", "axial") for c in cols_lower):
-                bar_path = path
-                break
-        if bar_path is None:
-            for path, cols in datasets.items():
-                if "bar" in path.lower() and cols:
-                    bar_path = path
-                    break
-
-        # Shell force tablosunu bul (NX/MX kolonu iceren)
-        shell_path = None
-        for path, cols in datasets.items():
-            if path == bar_path:
-                continue
-            cols_lower = [c.lower().replace(" ", "").replace("_", "") for c in cols]
-            if any(c in ("nx", "mx", "membranex", "shellnx") for c in cols_lower):
-                shell_path = path
-                break
-        if shell_path is None:
-            for path, cols in datasets.items():
-                if path == bar_path:
-                    continue
-                if "shell" in path.lower() and cols:
-                    shell_path = path
-                    break
-
-        # Tablolari oku
-        def _read_table(ds_path):
-            dataset = f[ds_path]
-            if dataset.dtype.names:
-                data = {}
-                for col_name in dataset.dtype.names:
-                    col_data = dataset[col_name]
-                    if col_data.dtype.kind in ("S", "O"):
-                        try:
-                            col_data = np.array(
-                                [x.decode("utf-8") if isinstance(x, bytes) else x for x in col_data]
-                            )
-                        except (UnicodeDecodeError, AttributeError):
-                            pass
-                    data[col_name] = col_data
-                return pd.DataFrame(data)
-            return pd.DataFrame(dataset[:])
-
-        if bar_path:
-            bar_df = _read_table(bar_path)
-            logger.info("Bar tablosu: %s (%d satir)", bar_path, len(bar_df))
+        # --- Bar element combined ---
+        if _BAR_TABLE_PATH in f:
+            bar_df = _read_h5_table(f, _BAR_TABLE_PATH)
+            if "Element_ID" in bar_df.columns:
+                bar_df = bar_df.rename(columns={"Element_ID": "Bar_EID"})
+            logger.info("Bar tablosu okundu: %s (%d satir, kolonlar: %s)",
+                       _BAR_TABLE_PATH, len(bar_df), list(bar_df.columns))
         else:
-            logger.warning("Prediction H5'te bar element tablosu bulunamadi")
+            logger.warning("Prediction H5'te '%s' bulunamadi", _BAR_TABLE_PATH)
+            # Mevcut yapıyı logla
+            def _log_struct(group, prefix=""):
+                for key in group:
+                    path = f"{prefix}/{key}" if prefix else key
+                    item = group[key]
+                    if isinstance(item, h5py.Group):
+                        _log_struct(item, path)
+                    elif isinstance(item, h5py.Dataset):
+                        cols = list(item.dtype.names) if item.dtype.names else []
+                        logger.info("  %s: %s", path, cols[:10])
+            _log_struct(f)
 
-        if shell_path:
-            shell_df = _read_table(shell_path)
-            logger.info("Shell tablosu: %s (%d satir)", shell_path, len(shell_df))
+        # --- Shell force combined ---
+        if _SHELL_TABLE_PATH in f:
+            shell_df = _read_h5_table(f, _SHELL_TABLE_PATH)
+            rename_map = {}
+            if "Element_ID" in shell_df.columns:
+                rename_map["Element_ID"] = "Shell_EID"
+            if "MX" in shell_df.columns:
+                rename_map["MX"] = "NX"
+            if "MY" in shell_df.columns:
+                rename_map["MY"] = "NY"
+            if "MXY" in shell_df.columns:
+                rename_map["MXY"] = "NXY"
+            shell_df = shell_df.rename(columns=rename_map)
+            logger.info("Shell tablosu okundu: %s (%d satir, kolonlar: %s)",
+                       _SHELL_TABLE_PATH, len(shell_df), list(shell_df.columns))
         else:
-            logger.warning("Prediction H5'te shell force tablosu bulunamadi")
+            logger.warning("Prediction H5'te '%s' bulunamadi", _SHELL_TABLE_PATH)
 
     return bar_df, shell_df
+
+
+def read_coefficients_from_excel(excel_path: str) -> pd.DataFrame:
+    """
+    Correlation Summary Excel'deki 'Total Summary' sheet'ini oku.
+
+    Beklenen kolonlar:
+      Bar_EID, Element_Type, Shell_EID, Target,
+      Coeff_Bar_Axial, Coeff_Shell_Nx, Coeff_Shell_Ny, Coeff_Shell_Nxy,
+      Intercept, R2
+    """
+    logger = logging.getLogger(__name__)
+    logger.info("Katsayilar Excel'den okunuyor: %s", excel_path)
+
+    try:
+        df = pd.read_excel(excel_path, sheet_name="Total Summary")
+    except ValueError:
+        xls = pd.ExcelFile(excel_path)
+        logger.info("Excel sheet'leri: %s", xls.sheet_names)
+        found = None
+        for name in xls.sheet_names:
+            if "total" in name.lower() and "summary" in name.lower():
+                found = name
+                break
+        if found is None:
+            for name in xls.sheet_names:
+                if "summary" in name.lower():
+                    found = name
+                    break
+        if found is None:
+            raise ValueError(
+                f"Excel dosyasinda 'Total Summary' sheet'i bulunamadi. "
+                f"Mevcut sheet'ler: {xls.sheet_names}"
+            )
+        df = pd.read_excel(excel_path, sheet_name=found)
+        logger.info("'%s' sheet'i kullanildi", found)
+
+    required = ["Bar_EID", "Element_Type", "Shell_EID", "Target", "Intercept"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Total Summary'de eksik kolonlar: {missing}. "
+            f"Mevcut kolonlar: {list(df.columns)}"
+        )
+
+    logger.info("  %d katsayi satiri okundu", len(df))
+    return df
 
 
 def predict_from_h5(
@@ -1587,7 +1623,7 @@ def predict_from_h5(
     prediction_h5_path: str,
     output_csv: str,
 ) -> pd.DataFrame:
-    """Ayri bir Prediction H5 dosyasindan veri okuyup tahmin yap."""
+    """In-memory korelasyon sonuclari + Prediction H5 -> tahmin CSV."""
     logger = logging.getLogger(__name__)
     bar_df, shell_df = read_prediction_h5(prediction_h5_path)
 
@@ -1598,7 +1634,7 @@ def predict_from_h5(
         logger.error("Prediction H5'te shell force verisi bulunamadi")
         return pd.DataFrame()
 
-    # Katsayilari topla
+    # In-memory sonuclardan katsayi tablosu olustur
     coeff_rows = []
     for res in per_shell_results:
         if not res.equations:
@@ -1620,13 +1656,30 @@ def predict_from_h5(
         return pd.DataFrame()
 
     coeff_df = pd.DataFrame(coeff_rows)
+    return _run_prediction(coeff_df, bar_df, shell_df, output_csv)
 
-    return predict_from_dataframes(
-        coefficients_df=coeff_df,
-        bar_forces_df=bar_df,
-        shell_forces_df=shell_df,
-        output_csv=output_csv,
-    )
+
+def predict_from_excel_and_h5(
+    coefficients_excel: str,
+    prediction_h5_path: str,
+    output_csv: str,
+) -> pd.DataFrame:
+    """
+    Bagimsiz tahmin: Correlation Summary Excel + Prediction H5 -> CSV.
+    Onceki analizden tamamen bagimsiz calisir.
+    """
+    logger = logging.getLogger(__name__)
+    coeff_df = read_coefficients_from_excel(coefficients_excel)
+    bar_df, shell_df = read_prediction_h5(prediction_h5_path)
+
+    if bar_df.empty:
+        logger.error("Prediction H5'te bar element verisi bulunamadi")
+        return pd.DataFrame()
+    if shell_df.empty:
+        logger.error("Prediction H5'te shell force verisi bulunamadi")
+        return pd.DataFrame()
+
+    return _run_prediction(coeff_df, bar_df, shell_df, output_csv)
 
 
 def predict_from_results(
@@ -1635,7 +1688,7 @@ def predict_from_results(
     shell_forces: Dict,
     output_csv: str,
 ) -> pd.DataFrame:
-    """Mevcut OP2 verileri ve korelasyon katsayilari ile tahmin yap."""
+    """Mevcut OP2 verileri ve korelasyon katsayilari ile tahmin yap (fallback)."""
     logger = logging.getLogger(__name__)
     rows = []
 
@@ -1693,16 +1746,31 @@ def predict_from_dataframes(
     shell_forces_df: pd.DataFrame,
     output_csv: str,
 ) -> pd.DataFrame:
-    """DataFrame formatindaki verilerle tahmin yap."""
-    logger = logging.getLogger(__name__)
+    """DataFrame formatindaki verilerle tahmin yap (eski uyumluluk)."""
     bar_df = _pred_normalize_bar_df(bar_forces_df)
     shell_df = _pred_normalize_shell_df(shell_forces_df)
-    coeff_df = coefficients_df.copy()
+    return _run_prediction(coefficients_df, bar_df, shell_df, output_csv)
 
-    logger.info("Prediction: bar_df %d satir, shell_df %d satir, coeff %d satir",
+
+def _run_prediction(
+    coeff_df: pd.DataFrame,
+    bar_df: pd.DataFrame,
+    shell_df: pd.DataFrame,
+    output_csv: str,
+) -> pd.DataFrame:
+    """
+    Core prediction engine.
+    Katsayilar + bar/shell kuvvetleri -> tahmin CSV.
+    """
+    logger = logging.getLogger(__name__)
+    bar_df = _pred_normalize_bar_df(bar_df)
+    shell_df = _pred_normalize_shell_df(shell_df)
+
+    logger.info("Prediction engine: bar %d satir, shell %d satir, coeff %d satir",
                 len(bar_df), len(shell_df), len(coeff_df))
-    logger.info("Bar kolonlar: %s", list(bar_df.columns))
-    logger.info("Shell kolonlar: %s", list(shell_df.columns))
+    logger.info("  Bar kolonlar: %s", list(bar_df.columns))
+    logger.info("  Shell kolonlar: %s", list(shell_df.columns))
+    logger.info("  Coeff kolonlar: %s", list(coeff_df.columns))
 
     rows = []
     groups = coeff_df.groupby(["Bar_EID", "Element_Type", "Shell_EID"])

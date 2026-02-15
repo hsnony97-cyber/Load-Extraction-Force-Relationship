@@ -36,7 +36,7 @@ from joint_load_extractor.op2_reader import OP2Reader, BarForceResult, ShellForc
 from joint_load_extractor.h5_reader import H5Reader
 from joint_load_extractor.correlation import CorrelationEngine, JointCorrelationResult
 from joint_load_extractor.reporter import ReportGenerator
-from joint_load_extractor.predictor import predict_from_results, predict_from_h5
+from joint_load_extractor.predictor import predict_from_results, predict_from_h5, predict_from_excel_and_h5
 
 
 def setup_logging(verbose: bool = False) -> None:
