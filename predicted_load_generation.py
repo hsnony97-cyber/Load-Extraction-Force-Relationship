@@ -136,9 +136,17 @@ def read_connectivity(excel_path: str) -> dict:
             df = df.dropna(subset=["Bar_EID", "Shell_EID"])
 
             for bar_eid, grp in df.groupby("Bar_EID"):
-                eids = [int(e) for e in grp["Shell_EID"].dropna()]
+                eids = []
+                for e in grp["Shell_EID"].dropna():
+                    try:
+                        eids.append(int(float(e)))
+                    except (ValueError, TypeError):
+                        continue
                 if eids:
-                    shell_map[int(bar_eid)] = list(set(eids))
+                    try:
+                        shell_map[int(float(bar_eid))] = list(set(eids))
+                    except (ValueError, TypeError):
+                        continue
             logger.info("  Connectivity: %d bar element", len(shell_map))
     else:
         logger.warning("Total Summary sheet bulunamadi - connectivity bos")
@@ -168,8 +176,11 @@ def read_prediction_h5(h5_path: str):
             bar_df = _h5_to_df(f[BAR_TABLE_PATH])
             if "Element_ID" in bar_df.columns:
                 bar_df = bar_df.rename(columns={"Element_ID": "Bar_EID"})
-            logger.info("  Bar: %d satir, kolonlar: %s",
-                        len(bar_df), list(bar_df.columns))
+            # H5 string dtype sorunu: tum kolonlari numerik yap
+            bar_df = _force_numeric(bar_df)
+            logger.info("  Bar: %d satir, kolonlar: %s, dtypes: %s",
+                        len(bar_df), list(bar_df.columns),
+                        {c: str(bar_df[c].dtype) for c in bar_df.columns[:5]})
         else:
             logger.error("  '%s' bulunamadi!", BAR_TABLE_PATH)
             _log_h5(f)
@@ -183,8 +194,11 @@ def read_prediction_h5(h5_path: str):
                 if old in shell_df.columns:
                     renames[old] = new
             shell_df = shell_df.rename(columns=renames)
-            logger.info("  Shell: %d satir, kolonlar: %s",
-                        len(shell_df), list(shell_df.columns))
+            # H5 string dtype sorunu: tum kolonlari numerik yap
+            shell_df = _force_numeric(shell_df)
+            logger.info("  Shell: %d satir, kolonlar: %s, dtypes: %s",
+                        len(shell_df), list(shell_df.columns),
+                        {c: str(shell_df[c].dtype) for c in shell_df.columns[:5]})
         else:
             logger.error("  '%s' bulunamadi!", SHELL_TABLE_PATH)
             _log_h5(f)
@@ -209,6 +223,19 @@ def _h5_to_df(dataset) -> pd.DataFrame:
             data[name] = col
         return pd.DataFrame(data)
     return pd.DataFrame(dataset[:])
+
+
+def _force_numeric(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    DataFrame'deki tum potansiyel numerik kolonlari pd.to_numeric ile donustur.
+    H5 dosyalari bazen numerik verileri string dtype ile saklar.
+    """
+    for col in df.columns:
+        try:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        except (ValueError, TypeError):
+            pass
+    return df
 
 
 def _log_h5(f):

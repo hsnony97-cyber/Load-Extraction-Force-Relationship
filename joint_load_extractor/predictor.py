@@ -242,9 +242,17 @@ def _extract_connectivity_from_excel(excel_path: str) -> Dict[int, List[int]]:
 
                 shell_map = {}
                 for bar_eid, group in df.groupby("Bar_EID"):
-                    shell_eids = [int(s) for s in group["Shell_EID"].dropna()]
+                    shell_eids = []
+                    for s in group["Shell_EID"].dropna():
+                        try:
+                            shell_eids.append(int(float(s)))
+                        except (ValueError, TypeError):
+                            continue
                     if shell_eids:
-                        shell_map[int(bar_eid)] = list(set(shell_eids))
+                        try:
+                            shell_map[int(float(bar_eid))] = list(set(shell_eids))
+                        except (ValueError, TypeError):
+                            continue
                 logger.info("  %d bar element icin connectivity bulundu", len(shell_map))
                 return shell_map
 
