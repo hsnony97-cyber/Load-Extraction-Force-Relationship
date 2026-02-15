@@ -1639,13 +1639,18 @@ def _extract_connectivity_from_excel(excel_path: str) -> Dict[int, List[int]]:
 
 
 def predict_from_h5(
-    correlation_results: List[JointCorrelationResult],
+    coefficients_excel: str,
     prediction_h5_path: str,
     output_csv: str,
     connectivity: Dict = None,
 ) -> pd.DataFrame:
-    """In-memory korelasyon sonuclari + Prediction H5 -> tahmin CSV."""
+    """Output Excel + Prediction H5 -> tahmin CSV."""
     logger = logging.getLogger(__name__)
+
+    # 1. Katsayilari Excel'den oku
+    coeff_df = read_coefficients_from_excel(coefficients_excel)
+
+    # 2. Prediction H5'ten kuvvetleri oku
     bar_df, shell_df = read_prediction_h5(prediction_h5_path)
 
     if bar_df.empty:
@@ -1655,27 +1660,12 @@ def predict_from_h5(
         logger.error("Prediction H5'te shell force verisi bulunamadi")
         return pd.DataFrame()
 
-    coeff_rows = []
-    for res in correlation_results:
-        if not res.equations:
-            continue
-        for eq in res.equations:
-            row = {
-                "Bar_EID": res.bar_eid,
-                "Element_Type": res.element_type,
-                "Target": eq.target_name,
-            }
-            for pname, coeff in zip(eq.predictor_names, eq.coefficients):
-                row[f"Coeff_{pname}"] = float(coeff)
-            row["Intercept"] = float(eq.intercept)
-            coeff_rows.append(row)
+    # 3. Connectivity: BDF'den geldiyse kullan, yoksa Excel'den cikar
+    if connectivity:
+        shell_eid_map = _build_shell_eid_map(connectivity)
+    else:
+        shell_eid_map = _extract_connectivity_from_excel(coefficients_excel)
 
-    if not coeff_rows:
-        logger.warning("Katsayi verisi bulunamadi")
-        return pd.DataFrame()
-
-    coeff_df = pd.DataFrame(coeff_rows)
-    shell_eid_map = _build_shell_eid_map(connectivity)
     return _run_prediction(coeff_df, bar_df, shell_df, output_csv, shell_eid_map)
 
 
@@ -1683,21 +1673,15 @@ def predict_from_excel_and_h5(
     coefficients_excel: str,
     prediction_h5_path: str,
     output_csv: str,
+    connectivity: Dict = None,
 ) -> pd.DataFrame:
-    """Bagimsiz tahmin: Correlation Summary Excel + Prediction H5 -> CSV."""
-    logger = logging.getLogger(__name__)
-    coeff_df = read_coefficients_from_excel(coefficients_excel)
-    bar_df, shell_df = read_prediction_h5(prediction_h5_path)
-
-    if bar_df.empty:
-        logger.error("Prediction H5'te bar element verisi bulunamadi")
-        return pd.DataFrame()
-    if shell_df.empty:
-        logger.error("Prediction H5'te shell force verisi bulunamadi")
-        return pd.DataFrame()
-
-    shell_eid_map = _extract_connectivity_from_excel(coefficients_excel)
-    return _run_prediction(coeff_df, bar_df, shell_df, output_csv, shell_eid_map)
+    """Bagimsiz tahmin: predict_from_h5 ile ayni."""
+    return predict_from_h5(
+        coefficients_excel=coefficients_excel,
+        prediction_h5_path=prediction_h5_path,
+        output_csv=output_csv,
+        connectivity=connectivity,
+    )
 
 
 def predict_from_results(
@@ -2734,9 +2718,10 @@ class Application(tk.Tk):
             csv_path = str(Path(output_path).with_suffix(".csv"))
 
             if pred_h5_path and Path(pred_h5_path).exists():
-                logger.info("  Prediction H5 dosyasi kullaniliyor: %s", pred_h5_path)
+                logger.info("  Prediction H5: %s", pred_h5_path)
+                logger.info("  Katsayilar:    %s (Correlation Summary sheet)", output_path)
                 pred_df = predict_from_h5(
-                    correlation_results=correlation_results,
+                    coefficients_excel=output_path,
                     prediction_h5_path=pred_h5_path,
                     output_csv=csv_path,
                     connectivity=connectivity,
@@ -2952,9 +2937,10 @@ def run_cli(args: argparse.Namespace) -> None:
 
     prediction_h5 = getattr(args, "prediction_h5", None)
     if prediction_h5 and Path(prediction_h5).exists():
-        logger.info("  Prediction H5 dosyasi kullaniliyor: %s", prediction_h5)
+        logger.info("  Prediction H5: %s", prediction_h5)
+        logger.info("  Katsayilar:    %s (Correlation Summary sheet)", output_path)
         pred_df = predict_from_h5(
-            correlation_results=correlation_results,
+            coefficients_excel=output_path,
             prediction_h5_path=prediction_h5,
             output_csv=csv_path,
             connectivity=connectivity,

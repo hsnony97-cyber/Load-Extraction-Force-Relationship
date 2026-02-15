@@ -29,7 +29,7 @@ import h5py
 import numpy as np
 import pandas as pd
 
-from joint_load_extractor.correlation import JointCorrelationResult, RegressionEquation
+from joint_load_extractor.correlation import JointCorrelationResult
 
 logger = logging.getLogger(__name__)
 
@@ -294,19 +294,25 @@ def predict_from_results(
 
 
 def predict_from_h5(
-    correlation_results: List[JointCorrelationResult],
+    coefficients_excel: str,
     prediction_h5_path: str,
     output_csv: str,
     connectivity: Dict = None,
 ) -> pd.DataFrame:
     """
-    In-memory korelasyon sonuclari + Prediction H5 -> tahmin CSV.
+    Output Excel + Prediction H5 -> tahmin CSV.
 
-    correlation_results'tan katsayilari alir.
-    Prediction H5'ten bar AF ve shell NX/NY/NXY verileri okunur.
-    connectivity ile hangi shell'lerin hangi bar'a bagli oldugu bilinir
-    ve ortalama shell kuvvetleri hesaplanir.
+    Akis:
+      1. Output Excel'in Correlation Summary sheet'inden katsayilari oku
+      2. Prediction H5'ten bar AF ve shell NX/NY/NXY oku
+      3. connectivity ile bagli shell'leri belirle, ortalamasini al
+      4. predicted = [AF, avg_NX, avg_NY, avg_NXY] @ coefficients + intercept
+      5. CSV yaz
     """
+    # 1. Katsayilari Excel'den oku
+    coeff_df = read_coefficients_from_excel(coefficients_excel)
+
+    # 2. Prediction H5'ten kuvvetleri oku
     bar_df, shell_df = read_prediction_h5(prediction_h5_path)
 
     if bar_df.empty:
@@ -316,30 +322,11 @@ def predict_from_h5(
         logger.error("Prediction H5'te shell force verisi bulunamadi")
         return pd.DataFrame()
 
-    # correlation_results'tan katsayi tablosu olustur (Shell_EID yok)
-    coeff_rows = []
-    for res in correlation_results:
-        if not res.equations:
-            continue
-        for eq in res.equations:
-            row = {
-                "Bar_EID": res.bar_eid,
-                "Element_Type": res.element_type,
-                "Target": eq.target_name,
-            }
-            for pname, coeff in zip(eq.predictor_names, eq.coefficients):
-                row[f"Coeff_{pname}"] = float(coeff)
-            row["Intercept"] = float(eq.intercept)
-            coeff_rows.append(row)
-
-    if not coeff_rows:
-        logger.warning("Katsayi verisi bulunamadi")
-        return pd.DataFrame()
-
-    coeff_df = pd.DataFrame(coeff_rows)
-
-    # Connectivity mapping: bar_eid -> [shell_eids]
-    shell_eid_map = _build_shell_eid_map(connectivity)
+    # 3. Connectivity: BDF'den geldiyse kullan, yoksa Excel'den cikar
+    if connectivity:
+        shell_eid_map = _build_shell_eid_map(connectivity)
+    else:
+        shell_eid_map = _extract_connectivity_from_excel(coefficients_excel)
 
     return _run_prediction(coeff_df, bar_df, shell_df, output_csv, shell_eid_map)
 
@@ -348,28 +335,18 @@ def predict_from_excel_and_h5(
     coefficients_excel: str,
     prediction_h5_path: str,
     output_csv: str,
+    connectivity: Dict = None,
 ) -> pd.DataFrame:
     """
     Bagimsiz tahmin: Correlation Summary Excel + Prediction H5 -> CSV.
-    Onceki analizden tamamen bagimsiz calisir.
-
-    Excel'den ortalama katsayilari (Correlation Summary) ve
-    connectivity bilgisini (Total Summary) okur.
+    predict_from_h5 ile ayni islem - iki farkli isimle cagirilabilir.
     """
-    coeff_df = read_coefficients_from_excel(coefficients_excel)
-    bar_df, shell_df = read_prediction_h5(prediction_h5_path)
-
-    if bar_df.empty:
-        logger.error("Prediction H5'te bar element verisi bulunamadi")
-        return pd.DataFrame()
-    if shell_df.empty:
-        logger.error("Prediction H5'te shell force verisi bulunamadi")
-        return pd.DataFrame()
-
-    # Connectivity Excel'den cikar
-    shell_eid_map = _extract_connectivity_from_excel(coefficients_excel)
-
-    return _run_prediction(coeff_df, bar_df, shell_df, output_csv, shell_eid_map)
+    return predict_from_h5(
+        coefficients_excel=coefficients_excel,
+        prediction_h5_path=prediction_h5_path,
+        output_csv=output_csv,
+        connectivity=connectivity,
+    )
 
 
 def predict_from_dataframes(

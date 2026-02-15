@@ -726,10 +726,11 @@ Ornek kullanim:
 
     prediction_h5 = getattr(args, "prediction_h5", None)
     if prediction_h5:
-        # Ayri Prediction H5 dosyasindan oku + ortalama shell kuvvetleri
-        logger.info("  Prediction H5 dosyasi kullaniliyor: %s", prediction_h5)
+        # Katsayilari output Excel'den, kuvvetleri Prediction H5'ten oku
+        logger.info("  Prediction H5: %s", prediction_h5)
+        logger.info("  Katsayilar:    %s (Correlation Summary sheet)", output_path)
         pred_df = predict_from_h5(
-            correlation_results=correlation_results,
+            coefficients_excel=output_path,
             prediction_h5_path=prediction_h5,
             output_csv=csv_path,
             connectivity=connectivity,
