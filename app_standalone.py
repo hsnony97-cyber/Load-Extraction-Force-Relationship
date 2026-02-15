@@ -1422,29 +1422,26 @@ class ReportGenerator:
 _BAR_TABLE_PATH = "ELFORCE_BAR_COMBINED/table"
 _SHELL_TABLE_PATH = "ELFORCE_SHELL_COMBINED/table"
 
+# Target -> CSV kolon adi (Predicted vs Actual ile ayni mantik)
+_TARGET_COL_MAP = {
+    "F Bearing X": "Pred_FX",
+    "F Bearing Y": "Pred_FY",
+    "NX Bypass": "Pred_NX",
+    "NY Bypass": "Pred_NY",
+    "NXY Bypass": "Pred_NXY",
+}
 
-def _pred_target_to_col(target_name: str) -> str:
-    """Hedef ismini tahmin kolon ismine donustur."""
-    mapping = {
-        "F Bearing X": "Pred_F_Bearing_X",
-        "F Bearing Y": "Pred_F_Bearing_Y",
-        "NX Bypass": "Pred_NX_Bypass",
-        "NY Bypass": "Pred_NY_Bypass",
-        "NXY Bypass": "Pred_NXY_Bypass",
-    }
-    return mapping.get(target_name, f"Pred_{target_name.replace(' ', '_')}")
+# Cikti kolon sirasi
+_OUTPUT_COLUMNS = [
+    "Bar_EID", "Element_Type", "Subcase_ID",
+    "Pred_FX", "Pred_FY", "Pred_NX", "Pred_NY", "Pred_NXY",
+]
 
 
-def _pred_order_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Kolon siralamasini duzenle."""
-    ordered_cols = [
-        "Bar_EID", "Element_Type", "Subcase_ID", "Shell_EID",
-        "AF", "NX", "NY", "NXY",
-        "Pred_F_Bearing_X", "Pred_F_Bearing_Y",
-        "Pred_NX_Bypass", "Pred_NY_Bypass", "Pred_NXY_Bypass",
-    ]
-    present = [c for c in ordered_cols if c in df.columns]
-    extra = [c for c in df.columns if c not in ordered_cols]
+def _pred_order_output(df: pd.DataFrame) -> pd.DataFrame:
+    """Cikti kolon siralamasini duzenle."""
+    present = [c for c in _OUTPUT_COLUMNS if c in df.columns]
+    extra = [c for c in df.columns if c not in _OUTPUT_COLUMNS]
     return df[present + extra]
 
 
@@ -1538,7 +1535,6 @@ def read_prediction_h5(h5_path: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
                        _BAR_TABLE_PATH, len(bar_df), list(bar_df.columns))
         else:
             logger.warning("Prediction H5'te '%s' bulunamadi", _BAR_TABLE_PATH)
-            # Mevcut yapıyı logla
             def _log_struct(group, prefix=""):
                 for key in group:
                     path = f"{prefix}/{key}" if prefix else key
@@ -1572,14 +1568,7 @@ def read_prediction_h5(h5_path: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
 
 
 def read_coefficients_from_excel(excel_path: str) -> pd.DataFrame:
-    """
-    Correlation Summary Excel'deki 'Total Summary' sheet'ini oku.
-
-    Beklenen kolonlar:
-      Bar_EID, Element_Type, Shell_EID, Target,
-      Coeff_Bar_Axial, Coeff_Shell_Nx, Coeff_Shell_Ny, Coeff_Shell_Nxy,
-      Intercept, R2
-    """
+    """Correlation Summary Excel'deki 'Total Summary' sheet'ini oku."""
     logger = logging.getLogger(__name__)
     logger.info("Katsayilar Excel'den okunuyor: %s", excel_path)
 
@@ -1634,7 +1623,6 @@ def predict_from_h5(
         logger.error("Prediction H5'te shell force verisi bulunamadi")
         return pd.DataFrame()
 
-    # In-memory sonuclardan katsayi tablosu olustur
     coeff_rows = []
     for res in per_shell_results:
         if not res.equations:
@@ -1644,8 +1632,8 @@ def predict_from_h5(
                 "Bar_EID": res.bar_eid,
                 "Element_Type": res.element_type,
                 "Shell_EID": res.shell_eid if res.shell_eid is not None else "",
+                "Target": eq.target_name,
             }
-            row["Target"] = eq.target_name
             for pname, coeff in zip(eq.predictor_names, eq.coefficients):
                 row[f"Coeff_{pname}"] = float(coeff)
             row["Intercept"] = float(eq.intercept)
@@ -1664,10 +1652,7 @@ def predict_from_excel_and_h5(
     prediction_h5_path: str,
     output_csv: str,
 ) -> pd.DataFrame:
-    """
-    Bagimsiz tahmin: Correlation Summary Excel + Prediction H5 -> CSV.
-    Onceki analizden tamamen bagimsiz calisir.
-    """
+    """Bagimsiz tahmin: Correlation Summary Excel + Prediction H5 -> CSV."""
     logger = logging.getLogger(__name__)
     coeff_df = read_coefficients_from_excel(coefficients_excel)
     bar_df, shell_df = read_prediction_h5(prediction_h5_path)
@@ -1688,7 +1673,12 @@ def predict_from_results(
     shell_forces: Dict,
     output_csv: str,
 ) -> pd.DataFrame:
-    """Mevcut OP2 verileri ve korelasyon katsayilari ile tahmin yap (fallback)."""
+    """
+    Mevcut OP2 verileri ile tahmin (fallback).
+    Predicted vs Actual mantigi ile birebir ayni:
+      predictor = [bar_axial, shell_nx, shell_ny, shell_nxy]
+      predicted = predictor @ coefficients + intercept
+    """
     logger = logging.getLogger(__name__)
     rows = []
 
@@ -1696,45 +1686,41 @@ def predict_from_results(
         if not res.equations:
             continue
         bar_eid = res.bar_eid
-        shell_eid = res.shell_eid
         element_type = res.element_type
-        if shell_eid is None:
+        if res.shell_eid is None:
             continue
 
-        eq_map = {eq.target_name: eq for eq in res.equations}
         subcases = res.matched_subcases if res.matched_subcases else []
+        pred_names = list(res.predictor_data.keys()) if res.predictor_data else []
+        n = min(len(v) for v in res.predictor_data.values()) if res.predictor_data else 0
 
-        for sc_id in subcases:
-            bar_result = bar_forces.get((sc_id, bar_eid))
-            if bar_result is None:
-                continue
-            af = float(np.mean(bar_result.axial_force))
+        if n == 0:
+            continue
 
-            sf = shell_forces.get((sc_id, shell_eid))
-            if sf is None:
-                continue
-            nx = float(np.mean(sf.membrane_x))
-            ny = float(np.mean(sf.membrane_y))
-            nxy = float(np.mean(sf.membrane_xy))
+        X = np.column_stack([res.predictor_data[k][:n] for k in pred_names])
+        sc_list = subcases[:n]
 
+        for i in range(n):
+            sc_id = sc_list[i] if i < len(sc_list) else 0
             row = {
                 "Bar_EID": bar_eid,
                 "Element_Type": element_type,
                 "Subcase_ID": sc_id,
-                "Shell_EID": shell_eid,
-                "AF": af, "NX": nx, "NY": ny, "NXY": nxy,
             }
-            predictors = np.array([af, nx, ny, nxy])
-            for target_name, eq in eq_map.items():
-                pred_val = float(np.dot(eq.coefficients, predictors) + eq.intercept)
-                row[_pred_target_to_col(target_name)] = pred_val
+            for eq in res.equations:
+                predicted = float(X[i] @ eq.coefficients + eq.intercept)
+                col_name = _TARGET_COL_MAP.get(
+                    eq.target_name,
+                    f"Pred_{eq.target_name.replace(' ', '_')}"
+                )
+                row[col_name] = predicted
             rows.append(row)
 
     if not rows:
         logger.warning("Tahmin icin veri bulunamadi")
         return pd.DataFrame()
 
-    df = _pred_order_columns(pd.DataFrame(rows))
+    df = _pred_order_output(pd.DataFrame(rows))
     df.to_csv(output_csv, index=False)
     logger.info("Tahmin CSV yazildi: %s (%d satir)", output_csv, len(df))
     return df
@@ -1759,8 +1745,10 @@ def _run_prediction(
     output_csv: str,
 ) -> pd.DataFrame:
     """
-    Core prediction engine.
-    Katsayilar + bar/shell kuvvetleri -> tahmin CSV.
+    Predicted vs Actual mantigi ile birebir ayni tahmin.
+      predictor = [bar_axial(AF), shell_nx, shell_ny, shell_nxy]
+      predicted = predictor @ coefficients + intercept
+    Cikti wide format: Bar_EID, Element_Type, Subcase_ID, Pred_FX, Pred_FY, Pred_NX, Pred_NY, Pred_NXY
     """
     logger = logging.getLogger(__name__)
     bar_df = _pred_normalize_bar_df(bar_df)
@@ -1768,9 +1756,6 @@ def _run_prediction(
 
     logger.info("Prediction engine: bar %d satir, shell %d satir, coeff %d satir",
                 len(bar_df), len(shell_df), len(coeff_df))
-    logger.info("  Bar kolonlar: %s", list(bar_df.columns))
-    logger.info("  Shell kolonlar: %s", list(shell_df.columns))
-    logger.info("  Coeff kolonlar: %s", list(coeff_df.columns))
 
     rows = []
     groups = coeff_df.groupby(["Bar_EID", "Element_Type", "Shell_EID"])
@@ -1808,24 +1793,29 @@ def _run_prediction(
             ny = float(shell_sc["ny"].mean())
             nxy = float(shell_sc["nxy"].mean())
 
+            predictor = np.array([af, nx, ny, nxy])
+
             row = {
                 "Bar_EID": int(bar_eid),
                 "Element_Type": int(et),
                 "Subcase_ID": int(sc_id),
-                "Shell_EID": int(shell_eid),
-                "AF": af, "NX": nx, "NY": ny, "NXY": nxy,
             }
-            predictors = np.array([af, nx, ny, nxy])
+
             for target_name, eq_info in eq_map.items():
-                pred_val = float(np.dot(eq_info["coeffs"], predictors) + eq_info["intercept"])
-                row[_pred_target_to_col(target_name)] = pred_val
+                predicted = float(predictor @ eq_info["coeffs"] + eq_info["intercept"])
+                col_name = _TARGET_COL_MAP.get(
+                    target_name,
+                    f"Pred_{target_name.replace(' ', '_')}"
+                )
+                row[col_name] = predicted
+
             rows.append(row)
 
     if not rows:
         logger.warning("Tahmin icin eslesen veri bulunamadi")
         return pd.DataFrame()
 
-    df = _pred_order_columns(pd.DataFrame(rows))
+    df = _pred_order_output(pd.DataFrame(rows))
     df.to_csv(output_csv, index=False)
     logger.info("Tahmin CSV yazildi: %s (%d satir)", output_csv, len(df))
     return df
