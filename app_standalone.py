@@ -1415,6 +1415,97 @@ class ReportGenerator:
 
 
 # ============================================================
+#  Predictor
+# ============================================================
+
+
+def predict_from_results(
+    per_shell_results: List[JointCorrelationResult],
+    bar_forces: Dict,
+    shell_forces: Dict,
+    output_csv: str,
+) -> pd.DataFrame:
+    """
+    Mevcut OP2 verileri ve korelasyon katsayilari ile tahmin yap.
+    Her (bar_eid, shell_eid, element_type, subcase) icin tahmin uretir.
+    """
+    logger = logging.getLogger(__name__)
+    rows = []
+
+    for res in per_shell_results:
+        if not res.equations:
+            continue
+
+        bar_eid = res.bar_eid
+        shell_eid = res.shell_eid
+        element_type = res.element_type
+
+        if shell_eid is None:
+            continue
+
+        eq_map = {eq.target_name: eq for eq in res.equations}
+        subcases = res.matched_subcases if res.matched_subcases else []
+
+        for sc_id in subcases:
+            bar_result = bar_forces.get((sc_id, bar_eid))
+            if bar_result is None:
+                continue
+            af = float(np.mean(bar_result.axial_force))
+
+            sf = shell_forces.get((sc_id, shell_eid))
+            if sf is None:
+                continue
+            nx = float(np.mean(sf.membrane_x))
+            ny = float(np.mean(sf.membrane_y))
+            nxy = float(np.mean(sf.membrane_xy))
+
+            row = {
+                "Bar_EID": bar_eid,
+                "Element_Type": element_type,
+                "Subcase_ID": sc_id,
+                "Shell_EID": shell_eid,
+                "AF": af,
+                "NX": nx,
+                "NY": ny,
+                "NXY": nxy,
+            }
+
+            predictors = np.array([af, nx, ny, nxy])
+            target_col_map = {
+                "F Bearing X": "Pred_F_Bearing_X",
+                "F Bearing Y": "Pred_F_Bearing_Y",
+                "NX Bypass": "Pred_NX_Bypass",
+                "NY Bypass": "Pred_NY_Bypass",
+                "NXY Bypass": "Pred_NXY_Bypass",
+            }
+            for target_name, eq in eq_map.items():
+                pred_val = float(np.dot(eq.coefficients, predictors) + eq.intercept)
+                col_name = target_col_map.get(target_name, f"Pred_{target_name.replace(' ', '_')}")
+                row[col_name] = pred_val
+
+            rows.append(row)
+
+    if not rows:
+        logger.warning("Tahmin icin veri bulunamadi")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    ordered_cols = [
+        "Bar_EID", "Element_Type", "Subcase_ID", "Shell_EID",
+        "AF", "NX", "NY", "NXY",
+        "Pred_F_Bearing_X", "Pred_F_Bearing_Y",
+        "Pred_NX_Bypass", "Pred_NY_Bypass", "Pred_NXY_Bypass",
+    ]
+    present = [c for c in ordered_cols if c in df.columns]
+    extra = [c for c in df.columns if c not in ordered_cols]
+    df = df[present + extra]
+
+    df.to_csv(output_csv, index=False)
+    logger.info("Tahmin CSV yazildi: %s (%d satir)", output_csv, len(df))
+    return df
+
+
+# ============================================================
 #  Ortak Fonksiyonlar (CLI + GUI)
 # ============================================================
 
@@ -2261,8 +2352,23 @@ class Application(tk.Tk):
                 per_shell_results=per_shell_results,
             )
 
+            # ADIM 7: Tahmin CSV
+            self._update_status("Adim 7/7: Tahmin CSV olusturuluyor...")
+            logger.info("ADIM 7: Tahmin CSV olusturuluyor...")
+
+            csv_path = str(Path(output_path).with_suffix(".csv"))
+            results_for_pred = per_shell_results if per_shell_results else correlation_results
+            pred_df = predict_from_results(
+                per_shell_results=results_for_pred,
+                bar_forces=bar_forces,
+                shell_forces=shell_forces,
+                output_csv=csv_path,
+            )
+            logger.info("  %d tahmin satiri yazildi: %s", len(pred_df), csv_path)
+
             logger.info("=" * 50)
             logger.info("TAMAMLANDI! Cikti: %s", output_path)
+            logger.info("Tahmin CSV: %s", csv_path)
 
             self._update_status(f"Tamamlandi! -> {output_path}")
             self.after(
@@ -2273,8 +2379,10 @@ class Application(tk.Tk):
                     f"OP2 dosya: {len(op2_paths)}\n"
                     f"Bar element: {len(bar_element_ids)}\n"
                     f"Baglanti: {len(connectivity)}\n"
-                    f"Korelasyon: {len(correlation_results)}\n\n"
-                    f"Cikti: {output_path}",
+                    f"Korelasyon: {len(correlation_results)}\n"
+                    f"Tahmin: {len(pred_df)} satir\n\n"
+                    f"Excel: {output_path}\n"
+                    f"CSV: {csv_path}",
                 ),
             )
 
@@ -2454,10 +2562,25 @@ def run_cli(args: argparse.Namespace) -> None:
         per_shell_results=per_shell_results,
     )
 
+    # ADIM 7: Tahmin CSV
+    logger.info("-" * 40)
+    logger.info("ADIM 7: Tahmin CSV olusturuluyor...")
+
+    csv_path = str(Path(args.output).with_suffix(".csv"))
+    results_for_pred = per_shell_results if per_shell_results else correlation_results
+    pred_df = predict_from_results(
+        per_shell_results=results_for_pred,
+        bar_forces=bar_forces,
+        shell_forces=shell_forces,
+        output_csv=csv_path,
+    )
+    logger.info("  %d tahmin satiri yazildi: %s", len(pred_df), csv_path)
+
     elapsed = time.time() - start_time
     logger.info("=" * 60)
     logger.info("TAMAMLANDI!")
     logger.info("Cikti dosyasi: %s", output_path)
+    logger.info("Tahmin CSV:    %s", csv_path)
     logger.info("Sure: %.1f saniye", elapsed)
     logger.info("=" * 60)
 
@@ -2470,7 +2593,9 @@ def run_cli(args: argparse.Namespace) -> None:
     print(f"  OP2 shell flux:        {len(shell_forces)}")
     print(f"  H5 Joint Load satir:   {len(h5_reader.joint_load_cap)}")
     print(f"  Korelasyon sonucu:     {len(correlation_results)}")
-    print(f"\n  Cikti: {output_path}")
+    print(f"  Tahmin satiri:         {len(pred_df)}")
+    print(f"\n  Excel cikti: {output_path}")
+    print(f"  Tahmin CSV:  {csv_path}")
 
 
 # ============================================================

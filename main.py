@@ -36,6 +36,7 @@ from joint_load_extractor.op2_reader import OP2Reader, BarForceResult, ShellForc
 from joint_load_extractor.h5_reader import H5Reader
 from joint_load_extractor.correlation import CorrelationEngine, JointCorrelationResult
 from joint_load_extractor.reporter import ReportGenerator
+from joint_load_extractor.predictor import predict_from_results
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -711,14 +712,31 @@ Ornek kullanim:
         per_shell_results=per_shell_results,
     )
 
+    # ============================================================
+    # ADIM 7: Tahmin (Prediction) CSV olustur
+    # ============================================================
+    logger.info("-" * 40)
+    logger.info("ADIM 7: Tahmin CSV olusturuluyor...")
+
+    csv_path = str(Path(args.output).with_suffix(".csv"))
+    results_for_pred = per_shell_results if per_shell_results else correlation_results
+    pred_df = predict_from_results(
+        per_shell_results=results_for_pred,
+        bar_forces=bar_forces,
+        shell_forces=shell_forces,
+        output_csv=csv_path,
+    )
+    logger.info("  %d tahmin satiri yazildi: %s", len(pred_df), csv_path)
+
     elapsed = time.time() - start_time
     logger.info("=" * 60)
     logger.info("TAMAMLANDI!")
     logger.info("Cikti dosyasi: %s", output_path)
+    logger.info("Tahmin CSV:    %s", csv_path)
     logger.info("Sure: %.1f saniye", elapsed)
     logger.info("=" * 60)
 
-    # Özet bilgi yazdır
+    # Ozet bilgi yazdir
     print(f"\nSonuc Ozeti:")
     print(f"  Bar element sayisi:    {len(bar_element_ids)}")
     print(f"  Baglanti bulunan:      {len(connectivity)}")
@@ -728,7 +746,9 @@ Ornek kullanim:
     print(f"  OP2 shell flux:        {len(shell_forces)}")
     print(f"  H5 Joint Load satir:   {len(h5_reader.joint_load_cap)}")
     print(f"  Korelasyon sonucu:     {len(correlation_results)}")
-    print(f"\n  Cikti: {output_path}")
+    print(f"  Tahmin satiri:         {len(pred_df)}")
+    print(f"\n  Excel cikti: {output_path}")
+    print(f"  Tahmin CSV:  {csv_path}")
 
 
 if __name__ == "__main__":
