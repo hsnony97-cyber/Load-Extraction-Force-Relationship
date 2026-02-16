@@ -9,12 +9,12 @@ Kullanim:
   3. "Generate" butonuna bas -> CSV olusturulur
 
 Akis:
-  - Correlation Summary sheet'inden katsayilar okunur
-  - Total Summary sheet'inden connectivity (bar -> shell) cikarilir
+  - Correlation Summary sheet'inden katsayilar okunur (long format, intercept yok)
+  - Shell_EIDs kolonu veya Predictor degerlerinden connectivity cikarilir
   - Prediction H5'ten bar AF ve shell NX/NY/NXY okunur
   - Her (bar_eid, element_type, subcase) icin:
-      avg_NX/NY/NXY = bagli tum shell'lerin ortalamasi
-      predicted = [AF, avg_NX, avg_NY, avg_NXY] @ coefficients + intercept
+      Her shell'in AYRI NX/NY/NXY degeri kullanilir
+      predicted = [AF, Shell1_Nx, Shell1_Ny, Shell1_Nxy, ...] @ coefficients
   - Cikti: Bar_EID, Element_Type, Subcase_ID, Pred_FX, Pred_FY, Pred_NX, Pred_NY, Pred_NXY
 
 CLI:
@@ -66,11 +66,11 @@ OUTPUT_PRED_COLUMNS = [
 
 def read_coefficients(excel_path: str) -> pd.DataFrame:
     """
-    Correlation Summary sheet'inden per-shell katsayilari oku.
+    Correlation Summary sheet'inden katsayilari oku (long format, intercept yok).
 
-    Kolonlar: Bar_EID, Element_Type, Target, Shell_EIDs,
-              Coeff_Bar_Axial, Coeff_Shell_{EID1}_Nx, ..._Ny, ..._Nxy, ...,
-              Intercept
+    Long format kolonlari:
+      Bar_EID | Element_Type | N_Shells | Shell_EIDs | Target |
+      Predictor | Coefficient | R_Squared | N_Samples
     """
     xls = pd.ExcelFile(excel_path)
     sheets = xls.sheet_names
@@ -93,37 +93,30 @@ def read_coefficients(excel_path: str) -> pd.DataFrame:
     if df is None:
         raise ValueError(f"Summary sheet bulunamadi. Mevcut: {sheets}")
 
-    required = ["Bar_EID", "Element_Type", "Target", "Intercept"]
+    required = ["Bar_EID", "Element_Type", "Target", "Predictor", "Coefficient"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"Eksik kolonlar: {missing}. Mevcut: {list(df.columns)}")
 
-    # Dinamik Coeff_* kolonlarini bul
-    coeff_cols = [c for c in df.columns if c.startswith("Coeff_")]
-    numeric_cols = coeff_cols + ["Intercept"]
-
-    for col in numeric_cols:
+    for col in ["Coefficient"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     for col in ["Bar_EID", "Element_Type"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     df = df.dropna(subset=["Bar_EID"])
-    for col in numeric_cols:
-        if col in df.columns:
-            df[col] = df[col].fillna(0.0)
+    df["Coefficient"] = df["Coefficient"].fillna(0.0)
 
-    logger.info("  %d katsayi satiri, %d Coeff kolonu, %d unique Bar_EID",
-                len(df), len(coeff_cols), df["Bar_EID"].nunique())
-    logger.info("  Coeff kolonlari: %s", coeff_cols[:10])
+    logger.info("  %d katsayi satiri (long format), %d unique Bar_EID",
+                len(df), df["Bar_EID"].nunique())
 
     return df
 
 
 def extract_shell_eids_from_coefficients(coeff_df: pd.DataFrame) -> dict:
     """
-    Katsayi DataFrame'inden bar_eid -> [shell_eids] eslesmesini cikar.
-    Shell_EIDs kolonu veya Coeff_Shell_XXXX_Nx isimlerinden.
+    Katsayi DataFrame'inden (long format) bar_eid -> [shell_eids] eslesmesini cikar.
+    Shell_EIDs kolonu veya Predictor degerlerinden parse.
     """
     import re
 
@@ -141,25 +134,17 @@ def extract_shell_eids_from_coefficients(coeff_df: pd.DataFrame) -> dict:
                 except (ValueError, TypeError):
                     pass
 
-    # Yontem 2: Kolon isimlerinden
-    if not shell_map:
-        shell_pattern = re.compile(r"Coeff_Shell_(\d+)_N[xXyY]+")
-        all_eids = set()
-        for col in coeff_df.columns:
-            m = shell_pattern.match(col)
-            if m:
-                all_eids.add(int(m.group(1)))
-
-        if all_eids:
-            for bar_eid, grp in coeff_df.groupby("Bar_EID"):
-                row = grp.iloc[0]
-                eids = []
-                for seid in sorted(all_eids):
-                    col_nx = f"Coeff_Shell_{seid}_Nx"
-                    if col_nx in row.index and pd.notna(row.get(col_nx)):
-                        eids.append(seid)
-                if eids:
-                    shell_map[int(float(bar_eid))] = eids
+    # Yontem 2: Predictor kolonu degerlerinden (long format)
+    if not shell_map and "Predictor" in coeff_df.columns:
+        shell_pred_pattern = re.compile(r"Shell_(\d+)_N[xXyY]+")
+        for bar_eid, grp in coeff_df.groupby("Bar_EID"):
+            eids = set()
+            for pred_name in grp["Predictor"].unique():
+                m = shell_pred_pattern.match(str(pred_name))
+                if m:
+                    eids.add(int(m.group(1)))
+            if eids:
+                shell_map[int(float(bar_eid))] = sorted(eids)
 
     logger.info("  Shell EIDs: %d bar element", len(shell_map))
     return shell_map
@@ -313,11 +298,12 @@ def generate_predictions(
     shell_eid_map: dict,
 ) -> pd.DataFrame:
     """
-    Per-shell katsayilarla tahmin. Reporter ile BIREBIR ayni mantik.
+    Per-shell katsayilarla tahmin (long format, intercept yok).
+    Reporter ile BIREBIR ayni mantik.
 
     Reporter'da:
       X = [Bar_Axial, Shell_{EID1}_Nx, Shell_{EID1}_Ny, Shell_{EID1}_Nxy, ...]
-      predicted = X @ eq.coefficients + eq.intercept
+      predicted = X @ eq.coefficients
 
     Her shell'in AYRI katsayisi var, ortalama ALINMAZ.
     """
@@ -325,16 +311,16 @@ def generate_predictions(
     shell_df = _normalize_shell(shell_df)
 
     logger.info("=" * 60)
-    logger.info("TAHMIN BASLADI (per-shell)")
+    logger.info("TAHMIN BASLADI (per-shell, long format)")
     logger.info("  Bar:   %d satir", len(bar_df))
     logger.info("  Shell: %d satir", len(shell_df))
     logger.info("  Coeff: %d satir", len(coeff_df))
     logger.info("  Shell EID map: %d bar", len(shell_eid_map))
 
-    groups = coeff_df.groupby(["Bar_EID", "Element_Type"])
     rows = []
 
-    for (bar_eid, et), grp in groups:
+    # Long format: group by (Bar_EID, Element_Type) ve her target icin predictor/katsayi
+    for (bar_eid, et), bar_et_grp in coeff_df.groupby(["Bar_EID", "Element_Type"]):
         bar_eid_int = int(float(bar_eid))
         et_int = int(float(et))
 
@@ -346,19 +332,23 @@ def generate_predictions(
 
         sorted_shells = sorted(connected)
 
-        # Her target icin katsayi vektoru hazirla
+        # Her target icin katsayi vektoru hazirla (long format'tan)
         eq_list = []
-        for _, crow in grp.iterrows():
-            target = str(crow["Target"])
-            intercept = float(crow.get("Intercept", 0.0) or 0.0)
+        for target, target_grp in bar_et_grp.groupby("Target"):
+            # Predictor -> Coefficient mapping
+            pred_coeff_map = {}
+            for _, crow in target_grp.iterrows():
+                pred_name = str(crow["Predictor"])
+                coeff_val = float(crow.get("Coefficient", 0.0) or 0.0)
+                pred_coeff_map[pred_name] = coeff_val
 
             # [Bar_Axial, Shell1_Nx, Shell1_Ny, Shell1_Nxy, Shell2_Nx, ...]
-            coeffs = [float(crow.get("Coeff_Bar_Axial", 0.0) or 0.0)]
+            coeffs = [pred_coeff_map.get("Bar_Axial", 0.0)]
             for seid in sorted_shells:
-                coeffs.append(float(crow.get(f"Coeff_Shell_{seid}_Nx", 0.0) or 0.0))
-                coeffs.append(float(crow.get(f"Coeff_Shell_{seid}_Ny", 0.0) or 0.0))
-                coeffs.append(float(crow.get(f"Coeff_Shell_{seid}_Nxy", 0.0) or 0.0))
-            eq_list.append((target, np.array(coeffs, dtype=float), intercept))
+                coeffs.append(pred_coeff_map.get(f"Shell_{seid}_Nx", 0.0))
+                coeffs.append(pred_coeff_map.get(f"Shell_{seid}_Ny", 0.0))
+                coeffs.append(pred_coeff_map.get(f"Shell_{seid}_Nxy", 0.0))
+            eq_list.append((str(target), np.array(coeffs, dtype=float)))
 
         # Bar AF
         bar_sub = bar_df[bar_df["bar_eid"] == bar_eid_int]
@@ -411,8 +401,8 @@ def generate_predictions(
             }
             row.update(predictor_info)
 
-            for target, coeffs, intercept in eq_list:
-                predicted = float(predictor_arr @ coeffs + intercept)
+            for target, coeffs in eq_list:
+                predicted = float(predictor_arr @ coeffs)
                 col_name = TARGET_COL_MAP.get(
                     target, f"Pred_{target.replace(' ', '_')}"
                 )

@@ -249,13 +249,12 @@ class ReportGenerator:
         header_fmt, number_fmt, int_fmt, border_fmt,
     ):
         """
-        Total Summary sheet'i - long format.
+        Total Summary sheet'i - long/vertical format.
 
-        Her hedef (target) icin ayri satir.
+        Her predictor icin ayri satir (intercept yok).
         Kolonlar:
-          Bar_EID | Element_Type | Subcase_ID | Shell_EID | Shell_Type |
-          Target | Coeff_Bar_Axial | Coeff_Shell_Nx | Coeff_Shell_Ny |
-          Coeff_Shell_Nxy | Intercept | R2
+          Bar_EID | Element_Type | N_Shells | Shell_EIDs |
+          Target | Predictor | Coefficient | R2
         """
         rows = []
         for res in correlation_results:
@@ -263,19 +262,18 @@ class ReportGenerator:
             base = {
                 "Bar_EID": res.bar_eid,
                 "Element_Type": res.element_type,
-                "Subcase_ID": res.subcase_id,
                 "N_Shells": res.n_connected_shells,
                 "Shell_EIDs": shell_eids_str,
             }
 
             for eq in res.equations:
-                row = dict(base)
-                row["Target"] = eq.target_name
                 for pname, coeff in zip(eq.predictor_names, eq.coefficients):
-                    row[f"Coeff_{pname}"] = float(coeff)
-                row["Intercept"] = float(eq.intercept)
-                row["R2"] = eq.r_squared
-                rows.append(row)
+                    row = dict(base)
+                    row["Target"] = eq.target_name
+                    row["Predictor"] = pname
+                    row["Coefficient"] = float(coeff)
+                    row["R2"] = eq.r_squared
+                    rows.append(row)
 
         if not rows:
             logger.info("Total Summary: veri yok, sheet atlaniyor")
@@ -293,15 +291,11 @@ class ReportGenerator:
         col_widths = {
             "Bar_EID": 12,
             "Element_Type": 12,
-            "Subcase_ID": 12,
-            "Shell_EID": 12,
-            "Shell_Type": 10,
+            "N_Shells": 10,
+            "Shell_EIDs": 20,
             "Target": 16,
-            "Coeff_Bar_Axial": 16,
-            "Coeff_Shell_Nx": 16,
-            "Coeff_Shell_Ny": 16,
-            "Coeff_Shell_Nxy": 16,
-            "Intercept": 14,
+            "Predictor": 20,
+            "Coefficient": 16,
             "R2": 10,
         }
         for col_idx, col_name in enumerate(df.columns):
@@ -353,7 +347,7 @@ class ReportGenerator:
                     continue
                 actual_arr = actual_arr[:n]
 
-                predicted_arr = X @ eq.coefficients + eq.intercept
+                predicted_arr = X @ eq.coefficients
 
                 for i in range(n):
                     actual_val = float(actual_arr[i])
@@ -484,23 +478,20 @@ class ReportGenerator:
                     row += 2
                     continue
 
-                # Tablo basliklari
-                eq_headers = [
-                    "Target", "Coeff Bar_Axial", "Coeff Shell_Nx",
-                    "Coeff Shell_Ny", "Coeff Shell_Nxy", "Intercept", "R²",
-                ]
+                # Tablo basliklari: long format - her predictor icin ayri satir
+                eq_headers = ["Target", "Predictor", "Coefficient", "R²"]
                 for j, h in enumerate(eq_headers):
                     ws.write(row, j, h, header_fmt)
                 row += 1
 
                 for eq in res.equations:
-                    ws.write(row, 0, eq.target_name, border_fmt)
-                    for ci, coeff in enumerate(eq.coefficients):
-                        ws.write(row, ci + 1, float(coeff), number_fmt)
-                    ws.write(row, 5, float(eq.intercept), number_fmt)
-                    r2_fmt = good_r2_fmt if eq.r_squared >= 0.7 else number_fmt
-                    ws.write(row, 6, eq.r_squared, r2_fmt)
-                    row += 1
+                    for pname, coeff in zip(eq.predictor_names, eq.coefficients):
+                        ws.write(row, 0, eq.target_name, border_fmt)
+                        ws.write(row, 1, pname, border_fmt)
+                        ws.write(row, 2, float(coeff), number_fmt)
+                        r2_fmt = good_r2_fmt if eq.r_squared >= 0.7 else number_fmt
+                        ws.write(row, 3, eq.r_squared, r2_fmt)
+                        row += 1
 
                 row += 1
 
@@ -514,5 +505,6 @@ class ReportGenerator:
                 row += 1
 
             ws.set_column(0, 0, 18)
-            ws.set_column(1, 5, 16)
-            ws.set_column(6, 6, 12)
+            ws.set_column(1, 1, 22)
+            ws.set_column(2, 2, 16)
+            ws.set_column(3, 3, 12)

@@ -179,7 +179,6 @@ def run_correlation_analysis(
       Target = a0*Bar_Axial
              + a1*Shell_{EID1}_Nx + a2*Shell_{EID1}_Ny + a3*Shell_{EID1}_Nxy
              + a4*Shell_{EID2}_Nx + ...
-             + intercept
     """
     logger = logging.getLogger(__name__)
     engine = CorrelationEngine()
