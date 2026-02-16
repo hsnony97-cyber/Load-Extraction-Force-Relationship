@@ -32,7 +32,7 @@ import h5py
 import numpy as np
 import pandas as pd
 from pyNastran.bdf.bdf import BDF
-from pyNastran.op2.op2 import OP2
+# pyNastran OP2 artik kullanilmiyor - Main H5 dosyasindan okunuyor
 
 
 
@@ -292,8 +292,12 @@ class BDFParser:
 
 
 # ============================================================
-#  OP2 Reader
+#  Force H5 Reader (Main H5 - prediction H5 formatinda)
 # ============================================================
+
+# H5 tablo yollari (prediction H5 ile ayni format)
+_BAR_TABLE_PATH = "ELFORCE_BAR_COMBINED/table"
+_SHELL_TABLE_PATH = "ELFORCE_SHELL_COMBINED/table"
 
 
 @dataclass
@@ -328,123 +332,94 @@ class ShellForceResult:
 
 
 class OP2Reader:
-    """OP2 dosyasindan element kuvvetlerini okur."""
+    """Main H5 dosyasindan element kuvvetlerini okur.
 
-    def __init__(self, op2_path: str):
-        self.op2_path = op2_path
-        self.op2: OP2 = None
+    H5 dosyasi prediction H5 ile ayni formatta olmalidir:
+      - ELFORCE_BAR_COMBINED/table:   Element_ID, Subcase_ID, AF
+      - ELFORCE_SHELL_COMBINED/table: Element_ID, Subcase_ID, MX, MY, MXY
+    """
+
+    def __init__(self, h5_path: str):
+        self.h5_path = h5_path
+        self._bar_df: pd.DataFrame = pd.DataFrame()
+        self._shell_df: pd.DataFrame = pd.DataFrame()
         self._available_subcases: List[int] = []
 
     def read(self) -> None:
         logger = logging.getLogger(__name__)
-        logger.info("OP2 dosyasi okunuyor: %s", self.op2_path)
-        self.op2 = OP2(debug=False)
-        self.op2.read_op2(self.op2_path)
+        logger.info("Main H5 dosyasi okunuyor: %s", self.h5_path)
+
+        with h5py.File(self.h5_path, "r") as f:
+            if _BAR_TABLE_PATH in f:
+                self._bar_df = self._read_h5_table(f, _BAR_TABLE_PATH)
+                self._normalize_bar_columns()
+                logger.info(
+                    "Bar tablosu okundu: %s (%d satir, kolonlar: %s)",
+                    _BAR_TABLE_PATH, len(self._bar_df), list(self._bar_df.columns),
+                )
+            else:
+                logger.warning("Main H5'te '%s' bulunamadi", _BAR_TABLE_PATH)
+
+            if _SHELL_TABLE_PATH in f:
+                self._shell_df = self._read_h5_table(f, _SHELL_TABLE_PATH)
+                self._normalize_shell_columns()
+                logger.info(
+                    "Shell tablosu okundu: %s (%d satir, kolonlar: %s)",
+                    _SHELL_TABLE_PATH, len(self._shell_df), list(self._shell_df.columns),
+                )
+            else:
+                logger.warning("Main H5'te '%s' bulunamadi", _SHELL_TABLE_PATH)
+
         self._available_subcases = self._collect_subcase_ids()
-        logger.info("OP2 okundu. Subcases: %s", self._available_subcases)
+        logger.info("Main H5 okundu. Subcases: %s", self._available_subcases)
 
     @property
     def subcases(self) -> List[int]:
         return self._available_subcases
 
     def _collect_subcase_ids(self) -> List[int]:
-        """OP2 sonuc tablolarindan mevcut subcase ID'lerini topla."""
         sc_ids: set = set()
-        for attr in (
-            "cbar_force", "cbeam_force",
-            "cquad4_force", "ctria3_force",
-            "cquad8_force", "ctria6_force",
-            "cshear_force",
-        ):
-            result_dict = getattr(self.op2, attr, None)
-            if result_dict:
-                sc_ids.update(result_dict.keys())
-        if hasattr(self.op2, "subcases") and self.op2.subcases:
-            sc_ids.update(self.op2.subcases.keys())
-        return sorted(sc_ids)
+        if not self._bar_df.empty and "subcase_id" in self._bar_df.columns:
+            sc_ids.update(self._bar_df["subcase_id"].unique().tolist())
+        if not self._shell_df.empty and "subcase_id" in self._shell_df.columns:
+            sc_ids.update(self._shell_df["subcase_id"].unique().tolist())
+        return sorted(int(s) for s in sc_ids)
 
     def get_bar_forces(
         self,
         bar_eids: List[int],
         subcase_id: Optional[int] = None,
     ) -> Dict[Tuple[int, int], BarForceResult]:
-        """Bar elementler icin kuvvetleri cikar."""
+        """Bar elementler icin axial force cikart."""
         logger = logging.getLogger(__name__)
         results = {}
 
-        # CBAR forces
-        for sc_id, force_obj in self.op2.cbar_force.items():
-            if subcase_id is not None and sc_id != subcase_id:
-                continue
+        if self._bar_df.empty:
+            logger.warning("Main H5'te bar element verisi bulunamadi")
+            return results
 
-            eids = force_obj.element
-            headers = force_obj.get_headers()
-            h_map = {h.lower().strip(): i for i, h in enumerate(headers)}
+        df = self._bar_df
+        if subcase_id is not None:
+            df = df[df["subcase_id"] == subcase_id]
+        df = df[df["element_id"].isin(bar_eids)]
 
-            axial_idx = self._find_header_index(h_map, ["axial_force", "axial"])
-            shear1_idx = self._find_header_index(h_map, ["shear1", "shear_1", "shear_plane1"])
-            shear2_idx = self._find_header_index(h_map, ["shear2", "shear_2", "shear_plane2"])
-            bma1_idx = self._find_header_index(h_map, ["bending_moment_a1", "bending_moment1a", "bm_end_a_plane1"])
-            bma2_idx = self._find_header_index(h_map, ["bending_moment_a2", "bending_moment2a", "bm_end_a_plane2"])
-            bmb1_idx = self._find_header_index(h_map, ["bending_moment_b1", "bending_moment1b", "bm_end_b_plane1"])
-            bmb2_idx = self._find_header_index(h_map, ["bending_moment_b2", "bending_moment2b", "bm_end_b_plane2"])
-            torque_idx = self._find_header_index(h_map, ["torque"])
+        for _, row in df.iterrows():
+            eid = int(row["element_id"])
+            sc_id = int(row["subcase_id"])
+            af = float(row.get("af", 0.0))
 
-            for bar_eid in bar_eids:
-                mask = eids == bar_eid
-                if not np.any(mask):
-                    continue
-                idx = np.where(mask)[0][0]
-                data = force_obj.data
-
-                results[(sc_id, bar_eid)] = BarForceResult(
-                    eid=bar_eid,
-                    subcase_id=sc_id,
-                    axial_force=data[:, idx, axial_idx] if axial_idx is not None else np.zeros(data.shape[0]),
-                    shear_1=data[:, idx, shear1_idx] if shear1_idx is not None else np.zeros(data.shape[0]),
-                    shear_2=data[:, idx, shear2_idx] if shear2_idx is not None else np.zeros(data.shape[0]),
-                    bending_moment_a1=data[:, idx, bma1_idx] if bma1_idx is not None else np.zeros(data.shape[0]),
-                    bending_moment_a2=data[:, idx, bma2_idx] if bma2_idx is not None else np.zeros(data.shape[0]),
-                    bending_moment_b1=data[:, idx, bmb1_idx] if bmb1_idx is not None else np.zeros(data.shape[0]),
-                    bending_moment_b2=data[:, idx, bmb2_idx] if bmb2_idx is not None else np.zeros(data.shape[0]),
-                    torque=data[:, idx, torque_idx] if torque_idx is not None else np.zeros(data.shape[0]),
-                )
-
-        # CBEAM forces
-        for sc_id, force_obj in self.op2.cbeam_force.items():
-            if subcase_id is not None and sc_id != subcase_id:
-                continue
-
-            eids = force_obj.element
-            headers = force_obj.get_headers()
-            h_map = {h.lower().strip(): i for i, h in enumerate(headers)}
-
-            axial_idx = self._find_header_index(h_map, ["axial_force", "axial"])
-            shear1_idx = self._find_header_index(h_map, ["shear1", "shear_1"])
-            shear2_idx = self._find_header_index(h_map, ["shear2", "shear_2"])
-            torque_idx = self._find_header_index(h_map, ["torque"])
-
-            for bar_eid in bar_eids:
-                if (sc_id, bar_eid) in results:
-                    continue
-                mask = eids == bar_eid
-                if not np.any(mask):
-                    continue
-                idx = np.where(mask)[0][0]
-                data = force_obj.data
-
-                results[(sc_id, bar_eid)] = BarForceResult(
-                    eid=bar_eid,
-                    subcase_id=sc_id,
-                    axial_force=data[:, idx, axial_idx] if axial_idx is not None else np.zeros(data.shape[0]),
-                    shear_1=data[:, idx, shear1_idx] if shear1_idx is not None else np.zeros(data.shape[0]),
-                    shear_2=data[:, idx, shear2_idx] if shear2_idx is not None else np.zeros(data.shape[0]),
-                    bending_moment_a1=np.zeros(data.shape[0]),
-                    bending_moment_a2=np.zeros(data.shape[0]),
-                    bending_moment_b1=np.zeros(data.shape[0]),
-                    bending_moment_b2=np.zeros(data.shape[0]),
-                    torque=data[:, idx, torque_idx] if torque_idx is not None else np.zeros(data.shape[0]),
-                )
+            results[(sc_id, eid)] = BarForceResult(
+                eid=eid,
+                subcase_id=sc_id,
+                axial_force=np.array([af]),
+                shear_1=np.array([0.0]),
+                shear_2=np.array([0.0]),
+                bending_moment_a1=np.array([0.0]),
+                bending_moment_a2=np.array([0.0]),
+                bending_moment_b1=np.array([0.0]),
+                bending_moment_b2=np.array([0.0]),
+                torque=np.array([0.0]),
+            )
 
         logger.info(
             "%d bar element icin kuvvet verisi bulundu (istenen: %d)",
@@ -457,78 +432,40 @@ class OP2Reader:
         shell_eids: List[int],
         subcase_id: Optional[int] = None,
     ) -> Dict[Tuple[int, int], ShellForceResult]:
-        """CQUAD4/CTRIA3 elementler icin membrane fluxlarini cikar."""
+        """Shell elementler icin membrane fluxlarini cikart."""
         logger = logging.getLogger(__name__)
         results = {}
 
-        force_attrs = [
-            ("cquad4_force", "CQUAD4"),
-            ("cquad8_force", "CQUAD8"),
-            ("ctria3_force", "CTRIA3"),
-            ("ctria6_force", "CTRIA6"),
-        ]
+        if self._shell_df.empty:
+            logger.warning("Main H5'te shell element verisi bulunamadi")
+            return results
 
-        for attr_name, elem_type in force_attrs:
-            force_dict = getattr(self.op2, attr_name, {})
-            if not force_dict:
-                continue
+        df = self._shell_df
+        if subcase_id is not None:
+            df = df[df["subcase_id"] == subcase_id]
+        df = df[df["element_id"].isin(shell_eids)]
 
-            for sc_id, force_obj in force_dict.items():
-                if subcase_id is not None and sc_id != subcase_id:
-                    continue
+        for _, row in df.iterrows():
+            eid = int(row["element_id"])
+            sc_id = int(row["subcase_id"])
+            nx = float(row.get("nx", 0.0))
+            ny = float(row.get("ny", 0.0))
+            nxy = float(row.get("nxy", 0.0))
+            elem_type = str(row.get("elem_type", "SHELL"))
 
-                eids = force_obj.element
-                headers = force_obj.get_headers()
-                h_map = {h.lower().strip(): i for i, h in enumerate(headers)}
-
-                mx_idx = self._find_header_index(
-                    h_map, ["membrane_x", "mx", "nx", "membrane_force_x", "oxx_membrane"],
-                )
-                my_idx = self._find_header_index(
-                    h_map, ["membrane_y", "my", "ny", "membrane_force_y", "oyy_membrane"],
-                )
-                mxy_idx = self._find_header_index(
-                    h_map, ["membrane_xy", "mxy", "nxy", "membrane_force_xy", "oxy_membrane"],
-                )
-                bx_idx = self._find_header_index(
-                    h_map, ["bending_x", "bmx", "bending_moment_x"],
-                )
-                by_idx = self._find_header_index(
-                    h_map, ["bending_y", "bmy", "bending_moment_y"],
-                )
-                bxy_idx = self._find_header_index(
-                    h_map, ["bending_xy", "bmxy", "bending_moment_xy"],
-                )
-                sx_idx = self._find_header_index(
-                    h_map, ["shear_xz", "tx", "qx", "transverse_shear_x"],
-                )
-                sy_idx = self._find_header_index(
-                    h_map, ["shear_yz", "ty", "qy", "transverse_shear_y"],
-                )
-
-                for shell_eid in shell_eids:
-                    if (sc_id, shell_eid) in results:
-                        continue
-                    mask = eids == shell_eid
-                    if not np.any(mask):
-                        continue
-                    idx = np.where(mask)[0][0]
-                    data = force_obj.data
-                    nt = data.shape[0]
-
-                    results[(sc_id, shell_eid)] = ShellForceResult(
-                        eid=shell_eid,
-                        elem_type=elem_type,
-                        subcase_id=sc_id,
-                        membrane_x=data[:, idx, mx_idx] if mx_idx is not None else np.zeros(nt),
-                        membrane_y=data[:, idx, my_idx] if my_idx is not None else np.zeros(nt),
-                        membrane_xy=data[:, idx, mxy_idx] if mxy_idx is not None else np.zeros(nt),
-                        bending_x=data[:, idx, bx_idx] if bx_idx is not None else np.zeros(nt),
-                        bending_y=data[:, idx, by_idx] if by_idx is not None else np.zeros(nt),
-                        bending_xy=data[:, idx, bxy_idx] if bxy_idx is not None else np.zeros(nt),
-                        shear_xz=data[:, idx, sx_idx] if sx_idx is not None else np.zeros(nt),
-                        shear_yz=data[:, idx, sy_idx] if sy_idx is not None else np.zeros(nt),
-                    )
+            results[(sc_id, eid)] = ShellForceResult(
+                eid=eid,
+                elem_type=elem_type,
+                subcase_id=sc_id,
+                membrane_x=np.array([nx]),
+                membrane_y=np.array([ny]),
+                membrane_xy=np.array([nxy]),
+                bending_x=np.array([0.0]),
+                bending_y=np.array([0.0]),
+                bending_xy=np.array([0.0]),
+                shear_xz=np.array([0.0]),
+                shear_yz=np.array([0.0]),
+            )
 
         logger.info(
             "%d shell element icin flux verisi bulundu (istenen: %d)",
@@ -538,14 +475,8 @@ class OP2Reader:
 
     def get_load_case_info(self) -> pd.DataFrame:
         rows = []
-        subcases_dict = getattr(self.op2, "subcases", None) or {}
         for sc_id in self._available_subcases:
-            label = str(sc_id)
-            if sc_id in subcases_dict:
-                sub = subcases_dict[sc_id]
-                if isinstance(sub, dict):
-                    label = str(sub.get("SUBTITLE", [""])[0])
-            rows.append({"Subcase_ID": sc_id, "Label": label})
+            rows.append({"Subcase_ID": sc_id, "Label": str(sc_id)})
         return pd.DataFrame(rows)
 
     @staticmethod
@@ -560,19 +491,15 @@ class OP2Reader:
         List[int],
     ]:
         """
-        Birden fazla OP2 dosyasini oku ve sonuclari birlestir.
-
-        Returns
-        -------
-        bar_forces, shell_forces, all_subcases
+        Birden fazla Main H5 dosyasini oku ve sonuclari birlestir.
         """
         logger = logging.getLogger(__name__)
         merged_bar: Dict[Tuple[int, int], BarForceResult] = {}
         merged_shell: Dict[Tuple[int, int], ShellForceResult] = {}
         all_subcases: set = set()
 
-        for op2_path in op2_paths:
-            reader = OP2Reader(op2_path)
+        for h5_path in op2_paths:
+            reader = OP2Reader(h5_path)
             reader.read()
             all_subcases.update(reader.subcases)
 
@@ -587,19 +514,58 @@ class OP2Reader:
                     merged_shell[key] = val
 
         logger.info(
-            "Toplu OP2: %d dosya, %d subcase, %d bar, %d shell sonuc",
+            "Toplu H5: %d dosya, %d subcase, %d bar, %d shell sonuc",
             len(op2_paths), len(all_subcases),
             len(merged_bar), len(merged_shell),
         )
         return merged_bar, merged_shell, sorted(all_subcases)
 
     @staticmethod
-    def _find_header_index(h_map: Dict[str, int], candidates: List[str]) -> Optional[int]:
-        for c in candidates:
-            c_lower = c.lower().strip()
-            if c_lower in h_map:
-                return h_map[c_lower]
-        return None
+    def _read_h5_table(f: h5py.File, path: str) -> pd.DataFrame:
+        """H5 dataset'ini DataFrame'e cevir."""
+        dataset = f[path]
+        if dataset.dtype.names:
+            data = {}
+            for col_name in dataset.dtype.names:
+                col_data = dataset[col_name]
+                if col_data.dtype.kind in ("S", "O"):
+                    try:
+                        col_data = np.array(
+                            [x.decode("utf-8") if isinstance(x, bytes) else x for x in col_data]
+                        )
+                    except (UnicodeDecodeError, AttributeError):
+                        pass
+                data[col_name] = col_data
+            return pd.DataFrame(data)
+        return pd.DataFrame(dataset[:])
+
+    def _normalize_bar_columns(self) -> None:
+        col_map = {}
+        for col in self._bar_df.columns:
+            lower = col.lower().replace(" ", "_").replace("-", "_")
+            if lower in ("element_id", "elementid", "bar_eid", "bareid", "bar_id", "eid", "id"):
+                col_map[col] = "element_id"
+            elif lower in ("subcase_id", "subcaseid", "subcase", "sc_id"):
+                col_map[col] = "subcase_id"
+            elif lower in ("af", "axial_force", "axialforce", "bar_axial", "axial"):
+                col_map[col] = "af"
+        self._bar_df = self._bar_df.rename(columns=col_map)
+
+    def _normalize_shell_columns(self) -> None:
+        col_map = {}
+        for col in self._shell_df.columns:
+            lower = col.lower().replace(" ", "_").replace("-", "_")
+            if lower in ("element_id", "elementid", "shell_eid", "shelleid", "eid", "id"):
+                col_map[col] = "element_id"
+            elif lower in ("subcase_id", "subcaseid", "subcase", "sc_id"):
+                col_map[col] = "subcase_id"
+            elif lower in ("mx", "nx", "membrane_x", "shell_nx"):
+                col_map[col] = "nx"
+            elif lower in ("my", "ny", "membrane_y", "shell_ny"):
+                col_map[col] = "ny"
+            elif lower in ("mxy", "nxy", "membrane_xy", "shell_nxy"):
+                col_map[col] = "nxy"
+        self._shell_df = self._shell_df.rename(columns=col_map)
 
 
 # ============================================================
@@ -854,7 +820,7 @@ CorrelationResult = JointCorrelationResult
 
 
 class CorrelationEngine:
-    """OP2 kuvvetleri ile H5 JOINT_LOADS_CAP arasinda coklu regresyon hesaplar."""
+    """Main H5 kuvvetleri ile H5 JOINT_LOADS_CAP arasinda coklu regresyon hesaplar."""
 
     H5_TARGET_COLUMNS = ["F Bearing X", "F Bearing Y", "NX Bypass", "NY Bypass", "NXY Bypass"]
 
@@ -1068,13 +1034,13 @@ class ReportGenerator:
 
             if not bar_forces_df.empty:
                 self._write_dataframe(
-                    writer, workbook, "OP2 Bar Forces", bar_forces_df,
+                    writer, workbook, "H5 Bar Forces", bar_forces_df,
                     header_fmt, number_fmt, int_fmt,
                 )
 
             if not shell_forces_df.empty:
                 self._write_dataframe(
-                    writer, workbook, "OP2 Shell Fluxes", shell_forces_df,
+                    writer, workbook, "H5 Shell Fluxes", shell_forces_df,
                     header_fmt, number_fmt, int_fmt,
                 )
 
@@ -2107,7 +2073,7 @@ def run_correlation_analysis(
 
         sc_keys = [k for k in bar_forces.keys() if k[1] == bar_eid]
         if not sc_keys:
-            logger.warning("Bar %d icin OP2 kuvvet verisi yok", bar_eid)
+            logger.warning("Bar %d icin Main H5 kuvvet verisi yok", bar_eid)
             continue
 
         # Bagli shell EID listesi
@@ -2169,8 +2135,8 @@ def run_correlation_analysis(
             bar_eid, len(collected_sc_ids), n_shells,
         )
 
-        # OP2 verilerini subcase_id'ye gore dict'e koy (H5 eslestirme icin)
-        op2_by_sc = {}
+        # Main H5 verilerini subcase_id'ye gore dict'e koy (H5 eslestirme icin)
+        h5_by_sc = {}
         for i, sc_id in enumerate(collected_sc_ids):
             sc_data = {"axial": collected_axial[i], "shells": {}}
             for seid in shells_with_full_data:
@@ -2179,7 +2145,7 @@ def run_correlation_analysis(
                     "ny": collected_shell[seid]["ny"][i],
                     "nxy": collected_shell[seid]["nxy"][i],
                 }
-            op2_by_sc[sc_id] = sc_data
+            h5_by_sc[sc_id] = sc_data
 
         # Element Type'a gore grupla
         et_col = _find_element_type_col(h5_data)
@@ -2212,8 +2178,8 @@ def run_correlation_analysis(
 
                 for idx, row in h5_subset.iterrows():
                     h5_sc = int(row[sc_col])
-                    if h5_sc in op2_by_sc:
-                        sc_data = op2_by_sc[h5_sc]
+                    if h5_sc in h5_by_sc:
+                        sc_data = h5_by_sc[h5_sc]
                         matched_axial.append(sc_data["axial"])
                         for seid in shells_with_full_data:
                             matched_shell[seid]["nx"].append(sc_data["shells"][seid]["nx"])
@@ -2226,16 +2192,16 @@ def run_correlation_analysis(
                 n_h5_total = len(h5_subset)
 
                 logger.info(
-                    "  Bar %d, ET %s: %d/%d H5 satir OP2 ile eslesti",
+                    "  Bar %d, ET %s: %d/%d H5 satir Main H5 ile eslesti",
                     bar_eid, et, n_matched, n_h5_total,
                 )
 
                 if not matched_h5_indices:
                     logger.warning(
                         "  Bar %d, ET %s: Hicbir subcase eslesmiyor! "
-                        "OP2 SC: %s, H5 SC: %s",
+                        "Main H5 SC: %s, H5 SC: %s",
                         bar_eid, et,
-                        sorted(op2_by_sc.keys()),
+                        sorted(h5_by_sc.keys()),
                         sorted(h5_subset[sc_col].unique().tolist()),
                     )
                     continue
@@ -2358,9 +2324,9 @@ def run_per_shell_correlation_analysis(
             if not per_shell_sc_ids:
                 continue
 
-            op2_by_sc = {}
+            h5_by_sc_ps = {}
             for i, sc_id in enumerate(per_shell_sc_ids):
-                op2_by_sc[sc_id] = {
+                h5_by_sc_ps[sc_id] = {
                     "axial": per_shell_axial[i],
                     "nx": per_shell_nx[i],
                     "ny": per_shell_ny[i],
@@ -2384,8 +2350,8 @@ def run_per_shell_correlation_analysis(
 
                     for idx, row in h5_subset.iterrows():
                         h5_sc = int(row[sc_col])
-                        if h5_sc in op2_by_sc:
-                            sc_data = op2_by_sc[h5_sc]
+                        if h5_sc in h5_by_sc_ps:
+                            sc_data = h5_by_sc_ps[h5_sc]
                             matched_axial.append(sc_data["axial"])
                             matched_nx.append(sc_data["nx"])
                             matched_ny.append(sc_data["ny"])
@@ -2564,8 +2530,8 @@ class Application(tk.Tk):
 
         self.op2_selector = FileSelector(
             file_frame,
-            "OP2 Dosyasi:",
-            [("Nastran OP2", "*.op2 *.OP2"), ("Tum Dosyalar", "*.*")],
+            "Main H5:",
+            [("HDF5", "*.h5 *.hdf5 *.H5 *.HDF5"), ("Tum Dosyalar", "*.*")],
             multiple=True,
         )
         self.op2_selector.grid(row=1, column=0, sticky="ew", pady=2)
@@ -2715,16 +2681,16 @@ class Application(tk.Tk):
                 messagebox.showerror("Dosya Bulunamadi", f"{name} bulunamadi:\n{path}")
                 return False
 
-        # OP2 dosyalari (toplu secim destegi)
-        op2_paths = self.op2_selector.get_multiple()
-        if not op2_paths:
-            messagebox.showwarning("Eksik Alan", "OP2 dosyasi secilmedi!")
+        # Main H5 dosyalari (toplu secim destegi)
+        h5_paths = self.op2_selector.get_multiple()
+        if not h5_paths:
+            messagebox.showwarning("Eksik Alan", "Main H5 dosyasi secilmedi!")
             return False
 
-        for op2_path in op2_paths:
-            if not Path(op2_path).exists():
+        for h5_path in h5_paths:
+            if not Path(h5_path).exists():
                 messagebox.showerror(
-                    "Dosya Bulunamadi", f"OP2 dosyasi bulunamadi:\n{op2_path}"
+                    "Dosya Bulunamadi", f"Main H5 dosyasi bulunamadi:\n{h5_path}"
                 )
                 return False
 
@@ -2765,7 +2731,7 @@ class Application(tk.Tk):
 
         try:
             bdf_path = self.bdf_selector.get()
-            op2_paths = self.op2_selector.get_multiple()
+            main_h5_paths = self.op2_selector.get_multiple()
             h5_path = self.h5_selector.get()
             excel_path = self.excel_selector.get()
             output_path = self.output_selector.get()
@@ -2796,18 +2762,18 @@ class Application(tk.Tk):
             logger.info("  %d bagli shell element", len(all_shell_eids))
 
             # ADIM 3
-            self._update_status("Adim 3/7: OP2 okunuyor (%d dosya)..." % len(op2_paths))
-            logger.info("ADIM 3: OP2 okunuyor (%d dosya)...", len(op2_paths))
+            self._update_status("Adim 3/7: Main H5 okunuyor (%d dosya)..." % len(main_h5_paths))
+            logger.info("ADIM 3: Main H5 okunuyor (%d dosya)...", len(main_h5_paths))
 
-            bar_forces, shell_forces, op2_subcases = OP2Reader.read_multiple(
-                op2_paths=op2_paths,
+            bar_forces, shell_forces, h5_subcases = OP2Reader.read_multiple(
+                op2_paths=main_h5_paths,
                 bar_eids=list(connectivity.keys()),
                 shell_eids=list(all_shell_eids),
                 subcase_id=subcase_id,
             )
             logger.info(
-                "  %d bar, %d shell kuvvet verisi (%d OP2 dosyasi)",
-                len(bar_forces), len(shell_forces), len(op2_paths),
+                "  %d bar, %d shell kuvvet verisi (%d Main H5 dosyasi)",
+                len(bar_forces), len(shell_forces), len(main_h5_paths),
             )
 
             # ADIM 4
@@ -2826,13 +2792,6 @@ class Application(tk.Tk):
             correlation_summary = engine.get_summary_dataframe()
             logger.info("  %d korelasyon sonucu", len(correlation_results))
 
-            # ADIM 5b: Per-shell korelasyon
-            logger.info("ADIM 5b: Per-shell korelasyon analizi...")
-            per_shell_results = run_per_shell_correlation_analysis(
-                connectivity, bar_forces, shell_forces, h5_reader, subcase_id
-            )
-            logger.info("  %d per-shell korelasyon sonucu", len(per_shell_results))
-
             # ADIM 6
             self._update_status("Adim 6/7: Rapor olusturuluyor...")
             logger.info("ADIM 6: Excel raporu olusturuluyor...")
@@ -2849,7 +2808,6 @@ class Application(tk.Tk):
                 h5_joint_loads=h5_reader.joint_load_cap,
                 correlation_results=correlation_results,
                 correlation_summary_df=correlation_summary,
-                per_shell_results=per_shell_results,
             )
 
             # ADIM 7: Tahmin CSV
@@ -2884,7 +2842,7 @@ class Application(tk.Tk):
                 lambda: messagebox.showinfo(
                     "Basarili",
                     f"Analiz tamamlandi!\n\n"
-                    f"OP2 dosya: {len(op2_paths)}\n"
+                    f"Main H5 dosya: {len(main_h5_paths)}\n"
                     f"Bar element: {len(bar_element_ids)}\n"
                     f"Baglanti: {len(connectivity)}\n"
                     f"Korelasyon: {len(correlation_results)}\n"
@@ -2975,15 +2933,15 @@ def run_cli(args: argparse.Namespace) -> None:
             sys.exit(1)
         logger.info("%s: %s", name, p.resolve())
 
-    # OP2 dosyalarini kontrol et
-    op2_paths = args.op2
-    for op2_path in op2_paths:
-        p = Path(op2_path)
+    # Main H5 dosyalarini kontrol et
+    main_h5_paths = args.main_h5
+    for h5_path in main_h5_paths:
+        p = Path(h5_path)
         if not p.exists():
-            logger.error("OP2 dosyasi bulunamadi: %s", op2_path)
+            logger.error("Main H5 dosyasi bulunamadi: %s", h5_path)
             sys.exit(1)
-        logger.info("OP2: %s", p.resolve())
-    logger.info("Toplam %d OP2 dosyasi", len(op2_paths))
+        logger.info("Main H5: %s", p.resolve())
+    logger.info("Toplam %d Main H5 dosyasi", len(main_h5_paths))
 
     # ADIM 1
     logger.info("-" * 40)
@@ -3008,10 +2966,10 @@ def run_cli(args: argparse.Namespace) -> None:
 
     # ADIM 3
     logger.info("-" * 40)
-    logger.info("ADIM 3: OP2 okunuyor (%d dosya)...", len(op2_paths))
+    logger.info("ADIM 3: Main H5 okunuyor (%d dosya)...", len(main_h5_paths))
 
-    bar_forces, shell_forces, op2_subcases = OP2Reader.read_multiple(
-        op2_paths=op2_paths,
+    bar_forces, shell_forces, h5_subcases = OP2Reader.read_multiple(
+        op2_paths=main_h5_paths,
         bar_eids=list(connectivity.keys()),
         shell_eids=list(all_shell_eids),
         subcase_id=args.subcase,
@@ -3039,18 +2997,6 @@ def run_cli(args: argparse.Namespace) -> None:
     correlation_summary = engine.get_summary_dataframe()
     logger.info("  %d korelasyon sonucu hesaplandi", len(correlation_results))
 
-    # ADIM 5b: Per-shell korelasyon
-    logger.info("-" * 40)
-    logger.info("ADIM 5b: Per-shell korelasyon analizi yapiliyor...")
-    per_shell_results = run_per_shell_correlation_analysis(
-        connectivity=connectivity,
-        bar_forces=bar_forces,
-        shell_forces=shell_forces,
-        h5_reader=h5_reader,
-        subcase_id=args.subcase,
-    )
-    logger.info("  %d per-shell korelasyon sonucu", len(per_shell_results))
-
     # ADIM 6
     logger.info("-" * 40)
     logger.info("ADIM 6: Excel raporu olusturuluyor...")
@@ -3067,7 +3013,6 @@ def run_cli(args: argparse.Namespace) -> None:
         h5_joint_loads=h5_reader.joint_load_cap,
         correlation_results=correlation_results,
         correlation_summary_df=correlation_summary,
-        per_shell_results=per_shell_results,
     )
 
     # ADIM 7: Tahmin CSV
@@ -3105,9 +3050,9 @@ def run_cli(args: argparse.Namespace) -> None:
     print(f"  Bar element sayisi:    {len(bar_element_ids)}")
     print(f"  Baglanti bulunan:      {len(connectivity)}")
     print(f"  Bagli shell element:   {len(all_shell_eids)}")
-    print(f"  OP2 dosya sayisi:      {len(op2_paths)}")
-    print(f"  OP2 bar kuvvet:        {len(bar_forces)}")
-    print(f"  OP2 shell flux:        {len(shell_forces)}")
+    print(f"  Main H5 dosya sayisi:  {len(main_h5_paths)}")
+    print(f"  H5 bar kuvvet:         {len(bar_forces)}")
+    print(f"  H5 shell flux:         {len(shell_forces)}")
     print(f"  H5 Joint Load satir:   {len(h5_reader.joint_load_cap)}")
     print(f"  Korelasyon sonucu:     {len(correlation_results)}")
     print(f"  Tahmin satiri:         {len(pred_df)}")
@@ -3128,9 +3073,9 @@ def main():
         epilog="""
 Kullanim modlari:
   python app_standalone.py                  # GUI baslatir (varsayilan)
-  python app_standalone.py --cli --bdf model.bdf --op2 model.op2 --h5 joint_loads.h5 --excel input.xlsx
-  python app_standalone.py --cli --bdf model.bdf --op2 file1.op2 file2.op2 file3.op2 --h5 joint_loads.h5 --excel input.xlsx
-  python app_standalone.py --cli --bdf model.bdf --op2 model.op2 --h5 joint_loads.h5 --excel input.xlsx --output results.xlsx --subcase 1
+  python app_standalone.py --cli --bdf model.bdf --main-h5 forces.h5 --h5 joint_loads.h5 --excel input.xlsx
+  python app_standalone.py --cli --bdf model.bdf --main-h5 file1.h5 file2.h5 --h5 joint_loads.h5 --excel input.xlsx
+  python app_standalone.py --cli --bdf model.bdf --main-h5 forces.h5 --h5 joint_loads.h5 --excel input.xlsx --output results.xlsx --subcase 1
         """,
     )
 
@@ -3140,7 +3085,7 @@ Kullanim modlari:
         help="Komut satiri modunda calistir (GUI yerine)",
     )
     parser.add_argument("--bdf", default=None, help="Nastran BDF dosyasi yolu")
-    parser.add_argument("--op2", default=None, nargs="+", help="Nastran OP2 dosyasi yolu (birden fazla dosya verilebilir)")
+    parser.add_argument("--main-h5", default=None, nargs="+", dest="main_h5", help="Main H5 dosyasi yolu - bar/shell kuvvetleri (birden fazla dosya verilebilir)")
     parser.add_argument("--h5", default=None, help="Joint Load Extraction H5 dosyasi yolu")
     parser.add_argument("--excel", default=None, help="Bar Element Set iceren Excel dosyasi yolu")
     parser.add_argument(
@@ -3164,9 +3109,9 @@ Kullanim modlari:
 
     if args.cli:
         missing = []
-        for param in ["bdf", "op2", "h5", "excel"]:
+        for param, param_name in [("bdf", "--bdf"), ("main_h5", "--main-h5"), ("h5", "--h5"), ("excel", "--excel")]:
             if getattr(args, param) is None:
-                missing.append(f"--{param}")
+                missing.append(param_name)
         if missing:
             parser.error(
                 f"CLI modunda su parametreler zorunludur: {', '.join(missing)}"

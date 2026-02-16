@@ -6,8 +6,8 @@ Sonuçları Excel formatında raporlar.
 Oluşturulan sheet'ler:
 1. Bar Element Set    - Input bar element listesi
 2. Element Connectivity - Bar elementler ve bağlı QUAD/TRIA
-3. OP2 Bar Forces     - Bar element axial force ve diğer kuvvetler
-4. OP2 Shell Fluxes   - Shell element membrane fluxları
+3. H5 Bar Forces      - Bar element axial force ve diger kuvvetler
+4. H5 Shell Fluxes    - Shell element membrane fluxlari
 5. H5 Joint Loads     - H5'ten okunan Joint Load Cap verileri
 6. Correlation Summary - Korelasyon matrisi ve regresyon sonuçları
 7. Bar_XXXX (per bar)  - Her bar element için detay sayfası
@@ -93,17 +93,17 @@ class ReportGenerator:
                 writer, workbook, connectivity, header_fmt, bar_fmt, quad_fmt, tria_fmt, int_fmt, border_fmt
             )
 
-            # 3. OP2 Bar Forces
+            # 3. H5 Bar Forces
             if not bar_forces_df.empty:
                 self._write_dataframe(
-                    writer, workbook, "OP2 Bar Forces", bar_forces_df,
+                    writer, workbook, "H5 Bar Forces", bar_forces_df,
                     header_fmt, number_fmt, int_fmt,
                 )
 
-            # 4. OP2 Shell Fluxes
+            # 4. H5 Shell Fluxes
             if not shell_forces_df.empty:
                 self._write_dataframe(
-                    writer, workbook, "OP2 Shell Fluxes", shell_forces_df,
+                    writer, workbook, "H5 Shell Fluxes", shell_forces_df,
                     header_fmt, number_fmt, int_fmt,
                 )
 

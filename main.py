@@ -3,22 +3,22 @@
 Joint Load Extraction Force Relationship Tool
 ==============================================
 
-BDF dosyasından bar elementler ve bağlı CQUAD4/CTRIA3 elementleri çıkarır,
-OP2'den kuvvetleri okur, H5'ten Joint Load Cap verilerini alır ve
-aralarındaki korelasyonu hesaplar.
+BDF dosyasindan bar elementler ve bagli CQUAD4/CTRIA3 elementleri cikarir,
+Main H5'ten kuvvetleri okur, H5'ten Joint Load Cap verilerini alir ve
+aralarindaki korelasyonu hesaplar.
 
-Kullanım:
-    python main.py --bdf model.bdf --op2 model.op2 --h5 joint_loads.h5 --excel input.xlsx --output output.xlsx
-    python main.py --bdf model.bdf --op2 file1.op2 file2.op2 file3.op2 --h5 joint_loads.h5 --excel input.xlsx
+Kullanim:
+    python main.py --bdf model.bdf --main-h5 forces.h5 --h5 joint_loads.h5 --excel input.xlsx --output output.xlsx
+    python main.py --bdf model.bdf --main-h5 file1.h5 file2.h5 file3.h5 --h5 joint_loads.h5 --excel input.xlsx
 
-Gerekli Input Dosyaları:
-    - BDF: Nastran bulk data dosyası (element bağlantıları için)
-    - OP2: Nastran output dosyası (kuvvetler/fluxlar için)
-    - H5:  Joint Load Extraction dosyası (Joint Load Cap tablosu)
-    - Excel: "Bar Element Set" sheet'i olan Excel dosyası (bar element listesi)
+Gerekli Input Dosyalari:
+    - BDF: Nastran bulk data dosyasi (element baglantilari icin)
+    - Main H5: Kuvvet/flux verileri (prediction H5 formatinda: ELFORCE_BAR_COMBINED, ELFORCE_SHELL_COMBINED)
+    - H5:  Joint Load Extraction dosyasi (Joint Load Cap tablosu)
+    - Excel: "Bar Element Set" sheet'i olan Excel dosyasi (bar element listesi)
 
-Çıktı:
-    - Excel dosyası: Bağlantı, kuvvetler, korelasyon sonuçları
+Cikti:
+    - Excel dosyasi: Baglanti, kuvvetler, korelasyon sonuclari
 """
 
 import argparse
@@ -40,7 +40,7 @@ from joint_load_extractor.predictor import predict_from_results, predict_from_h5
 
 
 def setup_logging(verbose: bool = False) -> None:
-    """Logging konfigürasyonu."""
+    """Logging konfigurasyonu."""
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
         level=level,
@@ -51,14 +51,14 @@ def setup_logging(verbose: bool = False) -> None:
 
 def read_bar_element_set(excel_path: str) -> List[int]:
     """
-    Excel dosyasından bar element listesini oku.
+    Excel dosyasindan bar element listesini oku.
 
-    "Bar Element Set" adlı sheet'ten ilk kolon okunur.
+    "Bar Element Set" adli sheet'ten ilk kolon okunur.
 
     Parameters
     ----------
     excel_path : str
-        Excel dosyası yolu.
+        Excel dosyasi yolu.
 
     Returns
     -------
@@ -71,12 +71,12 @@ def read_bar_element_set(excel_path: str) -> List[int]:
     try:
         df = pd.read_excel(excel_path, sheet_name="Bar Element Set")
     except ValueError:
-        # Sheet ismi biraz farklı olabilir
+        # Sheet ismi biraz farkli olabilir
         xls = pd.ExcelFile(excel_path)
         sheet_names = xls.sheet_names
         logger.info("Mevcut sheet'ler: %s", sheet_names)
 
-        # "bar" ve "element" içeren ilk sheet'i bul
+        # "bar" ve "element" iceren ilk sheet'i bul
         target_sheet = None
         for name in sheet_names:
             if "bar" in name.lower() and "element" in name.lower():
@@ -84,7 +84,7 @@ def read_bar_element_set(excel_path: str) -> List[int]:
                 break
 
         if target_sheet is None:
-            # İlk sheet'i kullan
+            # Ilk sheet'i kullan
             target_sheet = sheet_names[0]
             logger.warning(
                 "'Bar Element Set' bulunamadi, '%s' kullaniliyor", target_sheet
@@ -92,7 +92,7 @@ def read_bar_element_set(excel_path: str) -> List[int]:
 
         df = pd.read_excel(excel_path, sheet_name=target_sheet)
 
-    # İlk kolondaki değerleri al
+    # Ilk kolondaki degerleri al
     first_col = df.columns[0]
     bar_eids = df[first_col].dropna().astype(int).tolist()
     logger.info("%d bar element okundu", len(bar_eids))
@@ -102,10 +102,10 @@ def read_bar_element_set(excel_path: str) -> List[int]:
 def build_bar_forces_dataframe(
     bar_forces: Dict[Tuple[int, int], BarForceResult],
 ) -> pd.DataFrame:
-    """Bar kuvvet sonuçlarını DataFrame'e dönüştür."""
+    """Bar kuvvet sonuclarini DataFrame'e donustur."""
     rows = []
     for (sc_id, eid), result in sorted(bar_forces.items()):
-        # Her zaman adımı için bir satır
+        # Her zaman adimi icin bir satir
         for t_idx in range(len(result.axial_force)):
             rows.append({
                 "Subcase_ID": sc_id,
@@ -126,7 +126,7 @@ def build_bar_forces_dataframe(
 def build_shell_forces_dataframe(
     shell_forces: Dict[Tuple[int, int], ShellForceResult],
 ) -> pd.DataFrame:
-    """Shell flux sonuçlarını DataFrame'e dönüştür."""
+    """Shell flux sonuclarini DataFrame'e donustur."""
     rows = []
     for (sc_id, eid), result in sorted(shell_forces.items()):
         for t_idx in range(len(result.membrane_x)):
@@ -194,7 +194,7 @@ def run_correlation_analysis(
 
         sc_keys = [k for k in bar_forces.keys() if k[1] == bar_eid]
         if not sc_keys:
-            logger.warning("Bar %d icin OP2 kuvvet verisi yok", bar_eid)
+            logger.warning("Bar %d icin Main H5 kuvvet verisi yok", bar_eid)
             continue
 
         # Bagli shell EID listesi
@@ -256,8 +256,8 @@ def run_correlation_analysis(
             bar_eid, len(collected_sc_ids), n_shells,
         )
 
-        # OP2 verilerini subcase_id'ye gore dict'e koy (H5 eslestirme icin)
-        op2_by_sc = {}
+        # H5 verileri subcase_id'ye gore dict'e koy (H5 eslestirme icin)
+        h5_by_sc = {}
         for i, sc_id in enumerate(collected_sc_ids):
             sc_data = {"axial": collected_axial[i], "shells": {}}
             for seid in shells_with_full_data:
@@ -266,7 +266,7 @@ def run_correlation_analysis(
                     "ny": collected_shell[seid]["ny"][i],
                     "nxy": collected_shell[seid]["nxy"][i],
                 }
-            op2_by_sc[sc_id] = sc_data
+            h5_by_sc[sc_id] = sc_data
 
         # Element Type'a gore grupla
         et_col = _find_element_type_col(h5_data)
@@ -299,8 +299,8 @@ def run_correlation_analysis(
 
                 for idx, row in h5_subset.iterrows():
                     h5_sc = int(row[sc_col])
-                    if h5_sc in op2_by_sc:
-                        sc_data = op2_by_sc[h5_sc]
+                    if h5_sc in h5_by_sc:
+                        sc_data = h5_by_sc[h5_sc]
                         matched_axial.append(sc_data["axial"])
                         for seid in shells_with_full_data:
                             matched_shell[seid]["nx"].append(sc_data["shells"][seid]["nx"])
@@ -313,16 +313,16 @@ def run_correlation_analysis(
                 n_h5_total = len(h5_subset)
 
                 logger.info(
-                    "  Bar %d, ET %s: %d/%d H5 satir OP2 ile eslesti",
+                    "  Bar %d, ET %s: %d/%d H5 satir Main H5 ile eslesti",
                     bar_eid, et, n_matched, n_h5_total,
                 )
 
                 if not matched_h5_indices:
                     logger.warning(
                         "  Bar %d, ET %s: Hicbir subcase eslesmiyor! "
-                        "OP2 SC: %s, H5 SC: %s",
+                        "Main H5 SC: %s, H5 SC: %s",
                         bar_eid, et,
-                        sorted(op2_by_sc.keys()),
+                        sorted(h5_by_sc.keys()),
                         sorted(h5_subset[sc_col].unique().tolist()),
                     )
                     continue
@@ -375,16 +375,16 @@ def run_correlation_analysis(
 
 
 def main():
-    """Ana giriş noktası."""
+    """Ana giris noktasi."""
     parser = argparse.ArgumentParser(
         description="Joint Load Extraction Force Relationship Tool",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Ornek kullanim:
-  python main.py --bdf model.bdf --op2 model.op2 --h5 joint_loads.h5 --excel input.xlsx
-  python main.py --bdf model.bdf --op2 file1.op2 file2.op2 file3.op2 --h5 joint_loads.h5 --excel input.xlsx
-  python main.py --bdf model.bdf --op2 model.op2 --h5 joint_loads.h5 --excel input.xlsx --output results.xlsx --subcase 1
-  python main.py --bdf model.bdf --op2 model.op2 --h5 joint_loads.h5 --excel input.xlsx --h5-group "JOINT_LOADS_CAP/table"
+  python main.py --bdf model.bdf --main-h5 forces.h5 --h5 joint_loads.h5 --excel input.xlsx
+  python main.py --bdf model.bdf --main-h5 file1.h5 file2.h5 --h5 joint_loads.h5 --excel input.xlsx
+  python main.py --bdf model.bdf --main-h5 forces.h5 --h5 joint_loads.h5 --excel input.xlsx --output results.xlsx --subcase 1
+  python main.py --bdf model.bdf --main-h5 forces.h5 --h5 joint_loads.h5 --excel input.xlsx --h5-group "JOINT_LOADS_CAP/table"
         """,
     )
 
@@ -397,8 +397,9 @@ Ornek kullanim:
         help="Nastran BDF dosyasi yolu",
     )
     parser.add_argument(
-        "--op2", required=False, default=None, nargs="+",
-        help="Nastran OP2 dosyasi yolu (birden fazla dosya verilebilir)",
+        "--main-h5", required=False, default=None, nargs="+",
+        dest="main_h5",
+        help="Main H5 dosyasi yolu - bar/shell kuvvetleri (birden fazla dosya verilebilir)",
     )
     parser.add_argument(
         "--h5", required=False, default=None,
@@ -440,9 +441,14 @@ Ornek kullanim:
 
     # CLI modu: dosya parametreleri zorunlu
     missing = []
-    for param in ["bdf", "op2", "h5", "excel"]:
+    for param, param_name in [
+        ("bdf", "--bdf"),
+        ("main_h5", "--main-h5"),
+        ("h5", "--h5"),
+        ("excel", "--excel"),
+    ]:
         if getattr(args, param) is None:
-            missing.append(f"--{param}")
+            missing.append(param_name)
     if missing:
         parser.error(f"CLI modunda su parametreler zorunludur: {', '.join(missing)}\n"
                      f"Grafik arayuz icin: python main.py --gui")
@@ -455,7 +461,7 @@ Ornek kullanim:
     logger.info("Joint Load Extraction Force Relationship Tool")
     logger.info("=" * 60)
 
-    # Input dosya kontrolü
+    # Input dosya kontrolu
     for path_arg, name in [
         (args.bdf, "BDF"),
         (args.h5, "H5"),
@@ -467,15 +473,15 @@ Ornek kullanim:
             sys.exit(1)
         logger.info("%s: %s", name, p.resolve())
 
-    # OP2 dosyalarini kontrol et
-    op2_paths = args.op2
-    for op2_path in op2_paths:
-        p = Path(op2_path)
+    # Main H5 dosyalarini kontrol et
+    main_h5_paths = args.main_h5
+    for h5_path in main_h5_paths:
+        p = Path(h5_path)
         if not p.exists():
-            logger.error("OP2 dosyasi bulunamadi: %s", op2_path)
+            logger.error("Main H5 dosyasi bulunamadi: %s", h5_path)
             sys.exit(1)
-        logger.info("OP2: %s", p.resolve())
-    logger.info("Toplam %d OP2 dosyasi", len(op2_paths))
+        logger.info("Main H5: %s", p.resolve())
+    logger.info("Toplam %d Main H5 dosyasi", len(main_h5_paths))
 
     # ============================================================
     # ADIM 1: Excel'den bar element listesini oku
@@ -486,7 +492,7 @@ Ornek kullanim:
     logger.info("  %d bar element okundu", len(bar_element_ids))
 
     # ============================================================
-    # ADIM 2: BDF'yi parse et ve bağlantıları bul
+    # ADIM 2: BDF'yi parse et ve baglantilari bul
     # ============================================================
     logger.info("-" * 40)
     logger.info("ADIM 2: BDF parse ediliyor...")
@@ -496,7 +502,7 @@ Ornek kullanim:
     connectivity = bdf_parser.get_bar_connectivity(bar_element_ids)
     logger.info("  %d bar element icin baglanti bulundu", len(connectivity))
 
-    # Bağlı shell element listesi
+    # Bagli shell element listesi
     all_shell_eids = set()
     for info in connectivity.values():
         all_shell_eids.update(info.connected_quads.keys())
@@ -504,13 +510,13 @@ Ornek kullanim:
     logger.info("  Toplam %d bagli shell element", len(all_shell_eids))
 
     # ============================================================
-    # ADIM 3: OP2'den kuvvetleri oku (toplu dosya destegi)
+    # ADIM 3: Main H5'ten kuvvetleri oku
     # ============================================================
     logger.info("-" * 40)
-    logger.info("ADIM 3: OP2 okunuyor (%d dosya)...", len(op2_paths))
+    logger.info("ADIM 3: Main H5 okunuyor (%d dosya)...", len(main_h5_paths))
 
-    bar_forces, shell_forces, op2_subcases = OP2Reader.read_multiple(
-        op2_paths=op2_paths,
+    bar_forces, shell_forces, h5_subcases = OP2Reader.read_multiple(
+        op2_paths=main_h5_paths,
         bar_eids=list(connectivity.keys()),
         shell_eids=list(all_shell_eids),
         subcase_id=args.subcase,
@@ -543,7 +549,7 @@ Ornek kullanim:
     logger.info("  %d korelasyon sonucu hesaplandi", len(correlation_results))
 
     # ============================================================
-    # ADIM 6: Rapor oluştur
+    # ADIM 6: Rapor olustur
     # ============================================================
     logger.info("-" * 40)
     logger.info("ADIM 6: Excel raporu olusturuluyor...")
@@ -582,7 +588,7 @@ Ornek kullanim:
             connectivity=connectivity,
         )
     else:
-        # Mevcut OP2 verileriyle tahmin (correlation_results - ortalama shell)
+        # Mevcut Main H5 verileriyle tahmin (correlation_results)
         pred_df = predict_from_results(
             correlation_results=correlation_results,
             output_csv=csv_path,
@@ -602,9 +608,9 @@ Ornek kullanim:
     print(f"  Bar element sayisi:    {len(bar_element_ids)}")
     print(f"  Baglanti bulunan:      {len(connectivity)}")
     print(f"  Bagli shell element:   {len(all_shell_eids)}")
-    print(f"  OP2 dosya sayisi:      {len(op2_paths)}")
-    print(f"  OP2 bar kuvvet:        {len(bar_forces)}")
-    print(f"  OP2 shell flux:        {len(shell_forces)}")
+    print(f"  Main H5 dosya sayisi:  {len(main_h5_paths)}")
+    print(f"  H5 bar kuvvet:         {len(bar_forces)}")
+    print(f"  H5 shell flux:         {len(shell_forces)}")
     print(f"  H5 Joint Load satir:   {len(h5_reader.joint_load_cap)}")
     print(f"  Korelasyon sonucu:     {len(correlation_results)}")
     print(f"  Tahmin satiri:         {len(pred_df)}")

@@ -122,8 +122,8 @@ class Application(tk.Tk):
 
         self.op2_selector = FileSelector(
             file_frame,
-            "OP2 Dosyasi:",
-            [("Nastran OP2", "*.op2 *.OP2"), ("Tum Dosyalar", "*.*")],
+            "Main H5:",
+            [("HDF5", "*.h5 *.hdf5 *.H5 *.HDF5"), ("Tum Dosyalar", "*.*")],
         )
         self.op2_selector.grid(row=1, column=0, sticky="ew", pady=2)
 
@@ -258,7 +258,7 @@ class Application(tk.Tk):
         """Input dosyalarını kontrol et."""
         checks = [
             (self.bdf_selector.get(), "BDF dosyasi"),
-            (self.op2_selector.get(), "OP2 dosyasi"),
+            (self.op2_selector.get(), "Main H5 dosyasi"),
             (self.h5_selector.get(), "H5 dosyasi"),
             (self.excel_selector.get(), "Excel dosyasi"),
             (self.output_selector.get(), "Cikti dosyasi"),
@@ -326,11 +326,10 @@ class Application(tk.Tk):
                 build_bar_forces_dataframe,
                 build_shell_forces_dataframe,
                 run_correlation_analysis,
-                run_per_shell_correlation_analysis,
             )
 
             bdf_path = self.bdf_selector.get()
-            op2_path = self.op2_selector.get()
+            main_h5_path = self.op2_selector.get()
             h5_path = self.h5_selector.get()
             excel_path = self.excel_selector.get()
             output_path = self.output_selector.get()
@@ -360,15 +359,15 @@ class Application(tk.Tk):
             logger.info("  %d bagli shell element", len(all_shell_eids))
 
             # ADIM 3
-            self._update_status("Adim 3/6: OP2 okunuyor...")
-            logger.info("ADIM 3: OP2 okunuyor...")
-            op2_reader = OP2Reader(op2_path)
-            op2_reader.read()
+            self._update_status("Adim 3/6: Main H5 okunuyor...")
+            logger.info("ADIM 3: Main H5 okunuyor...")
+            h5_reader_main = OP2Reader(main_h5_path)
+            h5_reader_main.read()
 
-            bar_forces = op2_reader.get_bar_forces(
+            bar_forces = h5_reader_main.get_bar_forces(
                 list(connectivity.keys()), subcase_id
             )
-            shell_forces = op2_reader.get_shell_forces(
+            shell_forces = h5_reader_main.get_shell_forces(
                 list(all_shell_eids), subcase_id
             )
             logger.info("  %d bar, %d shell kuvvet verisi", len(bar_forces), len(shell_forces))
@@ -389,13 +388,6 @@ class Application(tk.Tk):
             correlation_summary = engine.get_summary_dataframe()
             logger.info("  %d korelasyon sonucu", len(correlation_results))
 
-            # ADIM 5b: Per-shell korelasyon
-            logger.info("ADIM 5b: Per-shell korelasyon analizi...")
-            per_shell_results = run_per_shell_correlation_analysis(
-                connectivity, bar_forces, shell_forces, h5_reader, subcase_id
-            )
-            logger.info("  %d per-shell korelasyon sonucu", len(per_shell_results))
-
             # ADIM 6
             self._update_status("Adim 6/6: Rapor olusturuluyor...")
             logger.info("ADIM 6: Excel raporu olusturuluyor...")
@@ -412,7 +404,6 @@ class Application(tk.Tk):
                 h5_joint_loads=h5_reader.joint_load_cap,
                 correlation_results=correlation_results,
                 correlation_summary_df=correlation_summary,
-                per_shell_results=per_shell_results,
             )
 
             logger.info("=" * 50)

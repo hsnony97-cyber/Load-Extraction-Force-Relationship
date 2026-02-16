@@ -1,24 +1,32 @@
 """
-OP2 Reader Module
+Force H5 Reader Module
 
-OP2 dosyasından bar elementler için axial force,
-CQUAD4/CTRIA3 elementler için membrane fluxlarını (NX, NY, NXY) okur.
+Main H5 dosyasindan bar elementler icin axial force,
+shell elementler icin membrane fluxlarini (NX, NY, NXY) okur.
+
+H5 dosyasi prediction H5 ile ayni formatta:
+  - ELFORCE_BAR_COMBINED/table:   Element_ID, Subcase_ID, AF
+  - ELFORCE_SHELL_COMBINED/table: Element_ID, Subcase_ID, MX(=NX), MY(=NY), MXY(=NXY)
 """
 
 import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+import h5py
 import numpy as np
 import pandas as pd
-from pyNastran.op2.op2 import OP2
 
 logger = logging.getLogger(__name__)
+
+# H5 tablo yollari (prediction H5 ile ayni format)
+BAR_TABLE_PATH = "ELFORCE_BAR_COMBINED/table"
+SHELL_TABLE_PATH = "ELFORCE_SHELL_COMBINED/table"
 
 
 @dataclass
 class BarForceResult:
-    """Bir bar element için kuvvet sonuçları."""
+    """Bir bar element icin kuvvet sonuclari."""
     eid: int
     subcase_id: int
     axial_force: np.ndarray          # (ntimes,)
@@ -33,7 +41,7 @@ class BarForceResult:
 
 @dataclass
 class ShellForceResult:
-    """Bir shell element için flux sonuçları."""
+    """Bir shell element icin flux sonuclari."""
     eid: int
     elem_type: str
     subcase_id: int
@@ -48,20 +56,51 @@ class ShellForceResult:
 
 
 class OP2Reader:
-    """OP2 dosyasından element kuvvetlerini okur."""
+    """Main H5 dosyasindan element kuvvetlerini okur.
 
-    def __init__(self, op2_path: str):
-        self.op2_path = op2_path
-        self.op2: OP2 = None
+    H5 dosyasi prediction H5 ile ayni formatta olmalidir:
+      - ELFORCE_BAR_COMBINED/table:   Element_ID, Subcase_ID, AF
+      - ELFORCE_SHELL_COMBINED/table: Element_ID, Subcase_ID, MX, MY, MXY
+    """
+
+    def __init__(self, h5_path: str):
+        self.h5_path = h5_path
+        self._bar_df: pd.DataFrame = pd.DataFrame()
+        self._shell_df: pd.DataFrame = pd.DataFrame()
         self._available_subcases: List[int] = []
 
     def read(self) -> None:
-        """OP2 dosyasını oku."""
-        logger.info("OP2 dosyasi okunuyor: %s", self.op2_path)
-        self.op2 = OP2(debug=False)
-        self.op2.read_op2(self.op2_path)
+        """Main H5 dosyasini oku."""
+        logger.info("Main H5 dosyasi okunuyor: %s", self.h5_path)
+
+        with h5py.File(self.h5_path, "r") as f:
+            # --- Bar element combined ---
+            if BAR_TABLE_PATH in f:
+                self._bar_df = self._read_h5_table(f, BAR_TABLE_PATH)
+                self._normalize_bar_columns()
+                logger.info(
+                    "Bar tablosu okundu: %s (%d satir, kolonlar: %s)",
+                    BAR_TABLE_PATH, len(self._bar_df), list(self._bar_df.columns),
+                )
+            else:
+                logger.warning("Main H5'te '%s' bulunamadi", BAR_TABLE_PATH)
+                self._log_h5_structure(f)
+
+            # --- Shell force combined ---
+            if SHELL_TABLE_PATH in f:
+                self._shell_df = self._read_h5_table(f, SHELL_TABLE_PATH)
+                self._normalize_shell_columns()
+                logger.info(
+                    "Shell tablosu okundu: %s (%d satir, kolonlar: %s)",
+                    SHELL_TABLE_PATH, len(self._shell_df), list(self._shell_df.columns),
+                )
+            else:
+                logger.warning("Main H5'te '%s' bulunamadi", SHELL_TABLE_PATH)
+                self._log_h5_structure(f)
+
+        # Subcase ID'leri topla
         self._available_subcases = self._collect_subcase_ids()
-        logger.info("OP2 okundu. Subcases: %s", self._available_subcases)
+        logger.info("Main H5 okundu. Subcases: %s", self._available_subcases)
 
     @staticmethod
     def read_multiple(
@@ -75,7 +114,7 @@ class OP2Reader:
         List[int],
     ]:
         """
-        Birden fazla OP2 dosyasini oku ve sonuclari birlestir.
+        Birden fazla Main H5 dosyasini oku ve sonuclari birlestir.
 
         Returns
         -------
@@ -84,14 +123,14 @@ class OP2Reader:
         shell_forces : Dict
             Birlestirilmis shell flux sonuclari.
         all_subcases : List[int]
-            Tum OP2'lerdeki subcase ID'leri.
+            Tum H5'lerdeki subcase ID'leri.
         """
         merged_bar: Dict[Tuple[int, int], BarForceResult] = {}
         merged_shell: Dict[Tuple[int, int], ShellForceResult] = {}
         all_subcases: set = set()
 
-        for op2_path in op2_paths:
-            reader = OP2Reader(op2_path)
+        for h5_path in op2_paths:
+            reader = OP2Reader(h5_path)
             reader.read()
             all_subcases.update(reader.subcases)
 
@@ -106,7 +145,7 @@ class OP2Reader:
                     merged_shell[key] = val
 
         logger.info(
-            "Toplu OP2: %d dosya, %d subcase, %d bar, %d shell sonuc",
+            "Toplu H5: %d dosya, %d subcase, %d bar, %d shell sonuc",
             len(op2_paths), len(all_subcases),
             len(merged_bar), len(merged_shell),
         )
@@ -117,29 +156,16 @@ class OP2Reader:
         return self._available_subcases
 
     def _collect_subcase_ids(self) -> List[int]:
-        """OP2 sonuc tablolarindan mevcut subcase ID'lerini topla."""
+        """H5 tablolarindan mevcut subcase ID'lerini topla."""
         sc_ids: set = set()
-        # Tum kuvvet sonuc dictionary'lerinden subcase key'lerini topla
-        for attr in (
-            "cbar_force", "cbeam_force",
-            "cquad4_force", "ctria3_force",
-            "cquad8_force", "ctria6_force",
-            "cshear_force",
-        ):
-            result_dict = getattr(self.op2, attr, None)
-            if result_dict:
-                sc_ids.update(result_dict.keys())
-        # Ek olarak subcases varsa onu da ekle (bazi pyNastran versiyonlari)
-        if hasattr(self.op2, "subcases") and self.op2.subcases:
-            sc_ids.update(self.op2.subcases.keys())
-        return sorted(sc_ids)
 
-    def _get_subcase_ids(self, subcase_id: Optional[int] = None) -> List[int]:
-        """Kullanılacak subcase ID'lerini belirle."""
-        if subcase_id is not None:
-            return [subcase_id]
-        # Tüm subcaseleri kullan
-        return self._available_subcases
+        if not self._bar_df.empty and "subcase_id" in self._bar_df.columns:
+            sc_ids.update(self._bar_df["subcase_id"].unique().tolist())
+
+        if not self._shell_df.empty and "subcase_id" in self._shell_df.columns:
+            sc_ids.update(self._shell_df["subcase_id"].unique().tolist())
+
+        return sorted(int(s) for s in sc_ids)
 
     def get_bar_forces(
         self,
@@ -147,14 +173,14 @@ class OP2Reader:
         subcase_id: Optional[int] = None,
     ) -> Dict[Tuple[int, int], BarForceResult]:
         """
-        Bar elementler için axial force ve diğer kuvvetleri çıkar.
+        Bar elementler icin axial force cikart.
 
         Parameters
         ----------
         bar_eids : List[int]
             Bar element ID listesi.
         subcase_id : Optional[int]
-            Belirli bir subcase. None ise tüm subcaseler.
+            Belirli bir subcase. None ise tum subcaseler.
 
         Returns
         -------
@@ -163,84 +189,37 @@ class OP2Reader:
         """
         results = {}
 
-        # CBAR forces
-        for sc_id, force_obj in self.op2.cbar_force.items():
-            if subcase_id is not None and sc_id != subcase_id:
-                continue
+        if self._bar_df.empty:
+            logger.warning("Main H5'te bar element verisi bulunamadi")
+            return results
 
-            eids = force_obj.element
-            headers = force_obj.get_headers()
-            logger.debug("CBAR force headers (SC %d): %s", sc_id, headers)
+        df = self._bar_df
 
-            # Header index mapping
-            h_map = {h.lower().strip(): i for i, h in enumerate(headers)}
+        # Subcase filtresi
+        if subcase_id is not None:
+            df = df[df["subcase_id"] == subcase_id]
 
-            axial_idx = self._find_header_index(h_map, ["axial_force", "axial"])
-            shear1_idx = self._find_header_index(h_map, ["shear1", "shear_1", "shear_plane1"])
-            shear2_idx = self._find_header_index(h_map, ["shear2", "shear_2", "shear_plane2"])
-            bma1_idx = self._find_header_index(h_map, ["bending_moment_a1", "bending_moment1a", "bm_end_a_plane1"])
-            bma2_idx = self._find_header_index(h_map, ["bending_moment_a2", "bending_moment2a", "bm_end_a_plane2"])
-            bmb1_idx = self._find_header_index(h_map, ["bending_moment_b1", "bending_moment1b", "bm_end_b_plane1"])
-            bmb2_idx = self._find_header_index(h_map, ["bending_moment_b2", "bending_moment2b", "bm_end_b_plane2"])
-            torque_idx = self._find_header_index(h_map, ["torque"])
+        # Istenen bar element ID'lerini filtrele
+        df = df[df["element_id"].isin(bar_eids)]
 
-            for bar_eid in bar_eids:
-                mask = eids == bar_eid
-                if not np.any(mask):
-                    continue
+        for _, row in df.iterrows():
+            eid = int(row["element_id"])
+            sc_id = int(row["subcase_id"])
+            af = float(row.get("af", 0.0))
 
-                idx = np.where(mask)[0][0]
-                data = force_obj.data  # (ntimes, nelements, ncolumns)
-
-                results[(sc_id, bar_eid)] = BarForceResult(
-                    eid=bar_eid,
-                    subcase_id=sc_id,
-                    axial_force=data[:, idx, axial_idx] if axial_idx is not None else np.zeros(data.shape[0]),
-                    shear_1=data[:, idx, shear1_idx] if shear1_idx is not None else np.zeros(data.shape[0]),
-                    shear_2=data[:, idx, shear2_idx] if shear2_idx is not None else np.zeros(data.shape[0]),
-                    bending_moment_a1=data[:, idx, bma1_idx] if bma1_idx is not None else np.zeros(data.shape[0]),
-                    bending_moment_a2=data[:, idx, bma2_idx] if bma2_idx is not None else np.zeros(data.shape[0]),
-                    bending_moment_b1=data[:, idx, bmb1_idx] if bmb1_idx is not None else np.zeros(data.shape[0]),
-                    bending_moment_b2=data[:, idx, bmb2_idx] if bmb2_idx is not None else np.zeros(data.shape[0]),
-                    torque=data[:, idx, torque_idx] if torque_idx is not None else np.zeros(data.shape[0]),
-                )
-
-        # CBEAM forces
-        for sc_id, force_obj in self.op2.cbeam_force.items():
-            if subcase_id is not None and sc_id != subcase_id:
-                continue
-
-            eids = force_obj.element
-            headers = force_obj.get_headers()
-            h_map = {h.lower().strip(): i for i, h in enumerate(headers)}
-
-            axial_idx = self._find_header_index(h_map, ["axial_force", "axial"])
-            shear1_idx = self._find_header_index(h_map, ["shear1", "shear_1"])
-            shear2_idx = self._find_header_index(h_map, ["shear2", "shear_2"])
-            torque_idx = self._find_header_index(h_map, ["torque"])
-
-            for bar_eid in bar_eids:
-                if (sc_id, bar_eid) in results:
-                    continue
-                mask = eids == bar_eid
-                if not np.any(mask):
-                    continue
-
-                idx = np.where(mask)[0][0]
-                data = force_obj.data
-
-                results[(sc_id, bar_eid)] = BarForceResult(
-                    eid=bar_eid,
-                    subcase_id=sc_id,
-                    axial_force=data[:, idx, axial_idx] if axial_idx is not None else np.zeros(data.shape[0]),
-                    shear_1=data[:, idx, shear1_idx] if shear1_idx is not None else np.zeros(data.shape[0]),
-                    shear_2=data[:, idx, shear2_idx] if shear2_idx is not None else np.zeros(data.shape[0]),
-                    bending_moment_a1=np.zeros(data.shape[0]),
-                    bending_moment_a2=np.zeros(data.shape[0]),
-                    bending_moment_b1=np.zeros(data.shape[0]),
-                    bending_moment_b2=np.zeros(data.shape[0]),
-                    torque=data[:, idx, torque_idx] if torque_idx is not None else np.zeros(data.shape[0]),
-                )
+            # H5'te sadece AF var, diger kuvvetler sifir
+            results[(sc_id, eid)] = BarForceResult(
+                eid=eid,
+                subcase_id=sc_id,
+                axial_force=np.array([af]),
+                shear_1=np.array([0.0]),
+                shear_2=np.array([0.0]),
+                bending_moment_a1=np.array([0.0]),
+                bending_moment_a2=np.array([0.0]),
+                bending_moment_b1=np.array([0.0]),
+                bending_moment_b2=np.array([0.0]),
+                torque=np.array([0.0]),
+            )
 
         found = len(results)
         logger.info(
@@ -256,14 +235,14 @@ class OP2Reader:
         subcase_id: Optional[int] = None,
     ) -> Dict[Tuple[int, int], ShellForceResult]:
         """
-        CQUAD4/CTRIA3 elementler için membrane fluxlarını çıkar.
+        Shell elementler icin membrane fluxlarini cikart.
 
         Parameters
         ----------
         shell_eids : List[int]
             Shell element ID listesi.
         subcase_id : Optional[int]
-            Belirli bir subcase. None ise tüm subcaseler.
+            Belirli bir subcase. None ise tum subcaseler.
 
         Returns
         -------
@@ -272,87 +251,43 @@ class OP2Reader:
         """
         results = {}
 
-        # Force result attributes ve karşılık gelen element tipleri
-        force_attrs = [
-            ("cquad4_force", "CQUAD4"),
-            ("cquad8_force", "CQUAD8"),
-            ("ctria3_force", "CTRIA3"),
-            ("ctria6_force", "CTRIA6"),
-        ]
+        if self._shell_df.empty:
+            logger.warning("Main H5'te shell element verisi bulunamadi")
+            return results
 
-        for attr_name, elem_type in force_attrs:
-            force_dict = getattr(self.op2, attr_name, {})
-            if not force_dict:
-                continue
+        df = self._shell_df
 
-            for sc_id, force_obj in force_dict.items():
-                if subcase_id is not None and sc_id != subcase_id:
-                    continue
+        # Subcase filtresi
+        if subcase_id is not None:
+            df = df[df["subcase_id"] == subcase_id]
 
-                eids = force_obj.element
-                headers = force_obj.get_headers()
-                h_map = {h.lower().strip(): i for i, h in enumerate(headers)}
-                logger.debug(
-                    "%s force headers (SC %d): %s", elem_type, sc_id, headers
-                )
+        # Istenen shell element ID'lerini filtrele
+        df = df[df["element_id"].isin(shell_eids)]
 
-                mx_idx = self._find_header_index(
-                    h_map,
-                    ["membrane_x", "mx", "nx", "membrane_force_x", "oxx_membrane"],
-                )
-                my_idx = self._find_header_index(
-                    h_map,
-                    ["membrane_y", "my", "ny", "membrane_force_y", "oyy_membrane"],
-                )
-                mxy_idx = self._find_header_index(
-                    h_map,
-                    ["membrane_xy", "mxy", "nxy", "membrane_force_xy", "oxy_membrane"],
-                )
-                bx_idx = self._find_header_index(
-                    h_map,
-                    ["bending_x", "bmx", "bending_moment_x"],
-                )
-                by_idx = self._find_header_index(
-                    h_map,
-                    ["bending_y", "bmy", "bending_moment_y"],
-                )
-                bxy_idx = self._find_header_index(
-                    h_map,
-                    ["bending_xy", "bmxy", "bending_moment_xy"],
-                )
-                sx_idx = self._find_header_index(
-                    h_map,
-                    ["shear_xz", "tx", "qx", "transverse_shear_x"],
-                )
-                sy_idx = self._find_header_index(
-                    h_map,
-                    ["shear_yz", "ty", "qy", "transverse_shear_y"],
-                )
+        for _, row in df.iterrows():
+            eid = int(row["element_id"])
+            sc_id = int(row["subcase_id"])
 
-                for shell_eid in shell_eids:
-                    if (sc_id, shell_eid) in results:
-                        continue
-                    mask = eids == shell_eid
-                    if not np.any(mask):
-                        continue
+            nx = float(row.get("nx", 0.0))
+            ny = float(row.get("ny", 0.0))
+            nxy = float(row.get("nxy", 0.0))
 
-                    idx = np.where(mask)[0][0]
-                    data = force_obj.data
-                    nt = data.shape[0]
+            # H5'te element tipi bilgisi yok, genel "SHELL" kullanilir
+            elem_type = str(row.get("elem_type", "SHELL"))
 
-                    results[(sc_id, shell_eid)] = ShellForceResult(
-                        eid=shell_eid,
-                        elem_type=elem_type,
-                        subcase_id=sc_id,
-                        membrane_x=data[:, idx, mx_idx] if mx_idx is not None else np.zeros(nt),
-                        membrane_y=data[:, idx, my_idx] if my_idx is not None else np.zeros(nt),
-                        membrane_xy=data[:, idx, mxy_idx] if mxy_idx is not None else np.zeros(nt),
-                        bending_x=data[:, idx, bx_idx] if bx_idx is not None else np.zeros(nt),
-                        bending_y=data[:, idx, by_idx] if by_idx is not None else np.zeros(nt),
-                        bending_xy=data[:, idx, bxy_idx] if bxy_idx is not None else np.zeros(nt),
-                        shear_xz=data[:, idx, sx_idx] if sx_idx is not None else np.zeros(nt),
-                        shear_yz=data[:, idx, sy_idx] if sy_idx is not None else np.zeros(nt),
-                    )
+            results[(sc_id, eid)] = ShellForceResult(
+                eid=eid,
+                elem_type=elem_type,
+                subcase_id=sc_id,
+                membrane_x=np.array([nx]),
+                membrane_y=np.array([ny]),
+                membrane_xy=np.array([nxy]),
+                bending_x=np.array([0.0]),
+                bending_y=np.array([0.0]),
+                bending_xy=np.array([0.0]),
+                shear_xz=np.array([0.0]),
+                shear_yz=np.array([0.0]),
+            )
 
         found = len(results)
         logger.info(
@@ -363,23 +298,97 @@ class OP2Reader:
         return results
 
     def get_load_case_info(self) -> pd.DataFrame:
-        """Mevcut subcaselerin bilgisini döndür."""
+        """Mevcut subcaselerin bilgisini dondur."""
         rows = []
-        subcases_dict = getattr(self.op2, "subcases", None) or {}
         for sc_id in self._available_subcases:
-            label = str(sc_id)
-            if sc_id in subcases_dict:
-                sub = subcases_dict[sc_id]
-                if isinstance(sub, dict):
-                    label = str(sub.get("SUBTITLE", [""])[0])
-            rows.append({"Subcase_ID": sc_id, "Label": label})
+            rows.append({"Subcase_ID": sc_id, "Label": str(sc_id)})
         return pd.DataFrame(rows)
 
+    # ================================================================
+    #  H5 okuma ve normalizasyon yardimci metodlari
+    # ================================================================
+
     @staticmethod
-    def _find_header_index(h_map: Dict[str, int], candidates: List[str]) -> Optional[int]:
-        """Header isimlerinden birini h_map'te ara."""
-        for c in candidates:
-            c_lower = c.lower().strip()
-            if c_lower in h_map:
-                return h_map[c_lower]
-        return None
+    def _read_h5_table(f: h5py.File, path: str) -> pd.DataFrame:
+        """H5 dataset'ini DataFrame'e cevir."""
+        dataset = f[path]
+        if dataset.dtype.names:
+            data = {}
+            for col_name in dataset.dtype.names:
+                col_data = dataset[col_name]
+                if col_data.dtype.kind in ("S", "O"):
+                    try:
+                        col_data = np.array(
+                            [x.decode("utf-8") if isinstance(x, bytes) else x for x in col_data]
+                        )
+                    except (UnicodeDecodeError, AttributeError):
+                        pass
+                data[col_name] = col_data
+            return pd.DataFrame(data)
+        return pd.DataFrame(dataset[:])
+
+    def _normalize_bar_columns(self) -> None:
+        """Bar forces DataFrame kolon isimlerini normalize et."""
+        col_map = {}
+        for col in self._bar_df.columns:
+            lower = col.lower().replace(" ", "_").replace("-", "_")
+            if lower in ("element_id", "elementid", "bar_eid", "bareid", "bar_id", "eid", "id"):
+                col_map[col] = "element_id"
+            elif lower in ("subcase_id", "subcaseid", "subcase", "sc_id"):
+                col_map[col] = "subcase_id"
+            elif lower in ("af", "axial_force", "axialforce", "bar_axial", "axial"):
+                col_map[col] = "af"
+
+        self._bar_df = self._bar_df.rename(columns=col_map)
+
+        for needed in ["element_id", "subcase_id", "af"]:
+            if needed not in self._bar_df.columns:
+                logger.warning(
+                    "Bar H5 tablosu: '%s' kolonu bulunamadi, mevcut: %s",
+                    needed, list(self._bar_df.columns),
+                )
+
+    def _normalize_shell_columns(self) -> None:
+        """Shell forces DataFrame kolon isimlerini normalize et."""
+        col_map = {}
+        for col in self._shell_df.columns:
+            lower = col.lower().replace(" ", "_").replace("-", "_")
+            if lower in ("element_id", "elementid", "shell_eid", "shelleid", "eid", "id"):
+                col_map[col] = "element_id"
+            elif lower in ("subcase_id", "subcaseid", "subcase", "sc_id"):
+                col_map[col] = "subcase_id"
+            elif lower in ("mx", "nx", "membrane_x", "shell_nx"):
+                col_map[col] = "nx"
+            elif lower in ("my", "ny", "membrane_y", "shell_ny"):
+                col_map[col] = "ny"
+            elif lower in ("mxy", "nxy", "membrane_xy", "shell_nxy"):
+                col_map[col] = "nxy"
+
+        self._shell_df = self._shell_df.rename(columns=col_map)
+
+        for needed in ["element_id", "subcase_id", "nx", "ny", "nxy"]:
+            if needed not in self._shell_df.columns:
+                logger.warning(
+                    "Shell H5 tablosu: '%s' kolonu bulunamadi, mevcut: %s",
+                    needed, list(self._shell_df.columns),
+                )
+
+    @staticmethod
+    def _log_h5_structure(f: h5py.File):
+        """H5 dosyasindaki tum gruplari/dataset'leri logla."""
+        paths = []
+
+        def _collect(group, prefix=""):
+            for key in group:
+                path = f"{prefix}/{key}" if prefix else key
+                item = group[key]
+                if isinstance(item, h5py.Group):
+                    _collect(item, path)
+                elif isinstance(item, h5py.Dataset):
+                    cols = list(item.dtype.names) if item.dtype.names else []
+                    paths.append((path, cols))
+
+        _collect(f)
+        logger.info("H5 yapisi (%d dataset):", len(paths))
+        for path, cols in paths:
+            logger.info("  %s: %s", path, cols[:10])
