@@ -175,8 +175,11 @@ def run_correlation_analysis(
     Korelasyon analizini calistir.
 
     Her bar element + element type icin TUM SUBCASE'LER uzerinden
-    veri toplayarak coklu regresyon denklemi olusturur:
-      Target = a1*Bar_Axial + a2*Avg_Nx + a3*Avg_Ny + a4*Avg_Nxy + b
+    per-shell kuvvetlerle coklu regresyon denklemi olusturur:
+      Target = a0*Bar_Axial
+             + a1*Shell_{EID1}_Nx + a2*Shell_{EID1}_Ny + a3*Shell_{EID1}_Nxy
+             + a4*Shell_{EID2}_Nx + ...
+             + intercept
     """
     logger = logging.getLogger(__name__)
     engine = CorrelationEngine()
@@ -198,64 +201,73 @@ def run_correlation_analysis(
         # Bagli shell EID listesi
         shell_eids = list(info.connected_quads.keys()) + list(info.connected_trias.keys())
 
-        # OP2 verilerini TUM subcase'ler uzerinden topla
-        # Her subcase'ten ortalama deger alinir (statik icin ntimes=1)
-        collected_sc_ids = []
-        collected_axial = []
-        collected_avg_nx = []
-        collected_avg_ny = []
-        collected_avg_nxy = []
-
+        # ---- Per-shell veri toplama ----
+        # Once bar verisi olan subcase'leri belirle
+        valid_sc_keys = []
         for sc_id_key, _ in sc_keys:
             if subcase_id is not None and sc_id_key != subcase_id:
                 continue
-
             bar_result = bar_forces.get((sc_id_key, bar_eid))
-            if bar_result is None:
-                continue
+            if bar_result is not None:
+                valid_sc_keys.append(sc_id_key)
 
-            shell_nx, shell_ny, shell_nxy = [], [], []
-            for seid in shell_eids:
-                sf = shell_forces.get((sc_id_key, seid))
-                if sf is not None:
-                    shell_nx.append(sf.membrane_x)
-                    shell_ny.append(sf.membrane_y)
-                    shell_nxy.append(sf.membrane_xy)
-
-            if not shell_nx:
-                continue
-
-            # Her subcase icin ortalama (ntimes boyunca mean)
-            axial_mean = np.mean(bar_result.axial_force)
-            avg_nx_mean = np.mean(np.mean(shell_nx, axis=0))
-            avg_ny_mean = np.mean(np.mean(shell_ny, axis=0))
-            avg_nxy_mean = np.mean(np.mean(shell_nxy, axis=0))
-
-            collected_sc_ids.append(sc_id_key)
-            collected_axial.append(axial_mean)
-            collected_avg_nx.append(avg_nx_mean)
-            collected_avg_ny.append(avg_ny_mean)
-            collected_avg_nxy.append(avg_nxy_mean)
-
-        if not collected_sc_ids:
-            logger.warning("Bar %d: Hicbir subcase icin veri toplanamadi", bar_eid)
+        if not valid_sc_keys:
+            logger.warning("Bar %d: Hicbir subcase icin bar verisi yok", bar_eid)
             continue
 
-        n_shells = len([s for s in shell_eids
-                        if shell_forces.get((collected_sc_ids[0], s)) is not None])
+        # Tum subcase'lerde verisi olan shell'leri bul
+        shells_with_full_data = []
+        for seid in shell_eids:
+            has_all = all(
+                shell_forces.get((sc_id, seid)) is not None
+                for sc_id in valid_sc_keys
+            )
+            if has_all:
+                shells_with_full_data.append(seid)
 
-        logger.info("  Bar %d: %d subcase, %d shell uzerinden veri toplandi",
-                     bar_eid, len(collected_sc_ids), n_shells)
+        if not shells_with_full_data:
+            logger.warning("Bar %d: Hicbir shell tum subcase'lerde veri yok", bar_eid)
+            continue
 
-        # OP2 verilerini subcase_id'ye gore dict'e koy (eslestirme icin)
+        # Per-shell veri toplama
+        collected_sc_ids = []
+        collected_axial = []
+        # {shell_eid: {"nx": [], "ny": [], "nxy": []}}
+        collected_shell = {
+            seid: {"nx": [], "ny": [], "nxy": []}
+            for seid in shells_with_full_data
+        }
+
+        for sc_id in valid_sc_keys:
+            bar_result = bar_forces.get((sc_id, bar_eid))
+            axial_mean = np.mean(bar_result.axial_force)
+
+            collected_sc_ids.append(sc_id)
+            collected_axial.append(axial_mean)
+
+            for seid in shells_with_full_data:
+                sf = shell_forces.get((sc_id, seid))
+                collected_shell[seid]["nx"].append(np.mean(sf.membrane_x))
+                collected_shell[seid]["ny"].append(np.mean(sf.membrane_y))
+                collected_shell[seid]["nxy"].append(np.mean(sf.membrane_xy))
+
+        n_shells = len(shells_with_full_data)
+        logger.info(
+            "  Bar %d: %d subcase, %d shell (per-shell predictor)",
+            bar_eid, len(collected_sc_ids), n_shells,
+        )
+
+        # OP2 verilerini subcase_id'ye gore dict'e koy (H5 eslestirme icin)
         op2_by_sc = {}
         for i, sc_id in enumerate(collected_sc_ids):
-            op2_by_sc[sc_id] = (
-                collected_axial[i],
-                collected_avg_nx[i],
-                collected_avg_ny[i],
-                collected_avg_nxy[i],
-            )
+            sc_data = {"axial": collected_axial[i], "shells": {}}
+            for seid in shells_with_full_data:
+                sc_data["shells"][seid] = {
+                    "nx": collected_shell[seid]["nx"][i],
+                    "ny": collected_shell[seid]["ny"][i],
+                    "nxy": collected_shell[seid]["nxy"][i],
+                }
+            op2_by_sc[sc_id] = sc_data
 
         # Element Type'a gore grupla
         et_col = _find_element_type_col(h5_data)
@@ -278,33 +290,32 @@ def run_correlation_analysis(
 
             # --- Subcase ID eslestirmesi ---
             if sc_col is not None:
-                # H5 satirlarini OP2 subcase ID'leri ile esleştir
                 matched_axial = []
-                matched_nx = []
-                matched_ny = []
-                matched_nxy = []
+                matched_shell = {
+                    seid: {"nx": [], "ny": [], "nxy": []}
+                    for seid in shells_with_full_data
+                }
                 matched_h5_indices = []
                 matched_sc_ids = []
 
                 for idx, row in h5_subset.iterrows():
                     h5_sc = int(row[sc_col])
                     if h5_sc in op2_by_sc:
-                        ax, nx, ny, nxy = op2_by_sc[h5_sc]
-                        matched_axial.append(ax)
-                        matched_nx.append(nx)
-                        matched_ny.append(ny)
-                        matched_nxy.append(nxy)
+                        sc_data = op2_by_sc[h5_sc]
+                        matched_axial.append(sc_data["axial"])
+                        for seid in shells_with_full_data:
+                            matched_shell[seid]["nx"].append(sc_data["shells"][seid]["nx"])
+                            matched_shell[seid]["ny"].append(sc_data["shells"][seid]["ny"])
+                            matched_shell[seid]["nxy"].append(sc_data["shells"][seid]["nxy"])
                         matched_h5_indices.append(idx)
                         matched_sc_ids.append(h5_sc)
 
                 n_matched = len(matched_h5_indices)
                 n_h5_total = len(h5_subset)
-                n_op2_total = len(collected_sc_ids)
 
                 logger.info(
-                    "  Bar %d, ET %s: %d/%d H5 satir OP2 ile eslesti "
-                    "(H5: %d satir, OP2: %d subcase)",
-                    bar_eid, et, n_matched, n_h5_total, n_h5_total, n_op2_total,
+                    "  Bar %d, ET %s: %d/%d H5 satir OP2 ile eslesti",
+                    bar_eid, et, n_matched, n_h5_total,
                 )
 
                 if not matched_h5_indices:
@@ -319,11 +330,16 @@ def run_correlation_analysis(
 
                 h5_matched = h5_subset.loc[matched_h5_indices].reset_index(drop=True)
                 pred_axial = np.array(matched_axial)
-                pred_nx = np.array(matched_nx)
-                pred_ny = np.array(matched_ny)
-                pred_nxy = np.array(matched_nxy)
+                shell_forces_per_eid = {
+                    seid: {
+                        "nx": np.array(matched_shell[seid]["nx"]),
+                        "ny": np.array(matched_shell[seid]["ny"]),
+                        "nxy": np.array(matched_shell[seid]["nxy"]),
+                    }
+                    for seid in shells_with_full_data
+                }
             else:
-                # Subcase kolonu yoksa eski davranis (sirali eslestirme)
+                # Subcase kolonu yoksa sirali eslestirme
                 logger.warning(
                     "  Bar %d: H5'te Subcase ID kolonu bulunamadi, "
                     "sirali eslestirme yapiliyor",
@@ -331,9 +347,14 @@ def run_correlation_analysis(
                 )
                 h5_matched = h5_subset
                 pred_axial = np.array(collected_axial)
-                pred_nx = np.array(collected_avg_nx)
-                pred_ny = np.array(collected_avg_ny)
-                pred_nxy = np.array(collected_avg_nxy)
+                shell_forces_per_eid = {
+                    seid: {
+                        "nx": np.array(collected_shell[seid]["nx"]),
+                        "ny": np.array(collected_shell[seid]["ny"]),
+                        "nxy": np.array(collected_shell[seid]["nxy"]),
+                    }
+                    for seid in shells_with_full_data
+                }
                 matched_sc_ids = list(collected_sc_ids)
 
             logger.info("  Bar %d, ElementType %s, %d eslesen veri noktasi",
@@ -341,12 +362,10 @@ def run_correlation_analysis(
 
             result = engine.compute_joint_correlation(
                 bar_eid=bar_eid,
-                subcase_id=0,  # tum subcase'ler birlesitirildi
+                subcase_id=0,
                 element_type=int(et),
                 bar_axial=pred_axial,
-                avg_shell_nx=pred_nx,
-                avg_shell_ny=pred_ny,
-                avg_shell_nxy=pred_nxy,
+                shell_forces_per_eid=shell_forces_per_eid,
                 h5_data=h5_matched,
                 n_shells=n_shells,
             )
@@ -354,163 +373,6 @@ def run_correlation_analysis(
             all_results.append(result)
 
     return engine, all_results
-
-
-def run_per_shell_correlation_analysis(
-    connectivity: Dict[int, BarElementInfo],
-    bar_forces: Dict[Tuple[int, int], BarForceResult],
-    shell_forces: Dict[Tuple[int, int], ShellForceResult],
-    h5_reader: H5Reader,
-    subcase_id: int = None,
-) -> List[JointCorrelationResult]:
-    """
-    Her bagli shell element icin AYRI AYRI korelasyon analizi calistir.
-
-    Ortalama almak yerine, her shell element icin bireysel regresyon:
-      Target = a1*Bar_Axial + a2*Shell_Nx + a3*Shell_Ny + a4*Shell_Nxy + b
-
-    Her (bar_eid, shell_eid, element_type) kombinasyonu icin ayri sonuc uretir.
-    """
-    logger = logging.getLogger(__name__)
-    per_shell_engine = CorrelationEngine()
-    per_shell_results = []
-
-    for bar_eid, info in sorted(connectivity.items()):
-        h5_data = h5_reader.get_joint_loads_for_bar(bar_eid)
-        if h5_data is None or h5_data.empty:
-            continue
-
-        sc_keys = [k for k in bar_forces.keys() if k[1] == bar_eid]
-        if not sc_keys:
-            continue
-
-        # Shell EID -> (type_str) eslesmesi
-        shell_info = {}
-        for qeid in info.connected_quads:
-            shell_info[qeid] = "CQUAD4"
-        for teid in info.connected_trias:
-            shell_info[teid] = "CTRIA3"
-
-        # Her subcase icin bar axial toplama
-        collected_sc_ids = []
-        collected_axial = []
-
-        for sc_id_key, _ in sc_keys:
-            if subcase_id is not None and sc_id_key != subcase_id:
-                continue
-            bar_result = bar_forces.get((sc_id_key, bar_eid))
-            if bar_result is None:
-                continue
-            collected_sc_ids.append(sc_id_key)
-            collected_axial.append(np.mean(bar_result.axial_force))
-
-        if not collected_sc_ids:
-            continue
-
-        # Element Type ve Subcase kolonlarini bul
-        et_col = _find_element_type_col(h5_data)
-        sc_col = _find_subcase_col(h5_data)
-        element_types = sorted(h5_data[et_col].unique()) if et_col else [0]
-
-        # Her shell element icin ayri regresyon
-        for shell_eid, shell_type_str in shell_info.items():
-            # Bu shell icin subcase bazli veri topla
-            per_shell_sc_ids = []
-            per_shell_axial = []
-            per_shell_nx = []
-            per_shell_ny = []
-            per_shell_nxy = []
-
-            for i, sc_id in enumerate(collected_sc_ids):
-                sf = shell_forces.get((sc_id, shell_eid))
-                if sf is None:
-                    continue
-                per_shell_sc_ids.append(sc_id)
-                per_shell_axial.append(collected_axial[i])
-                per_shell_nx.append(np.mean(sf.membrane_x))
-                per_shell_ny.append(np.mean(sf.membrane_y))
-                per_shell_nxy.append(np.mean(sf.membrane_xy))
-
-            if not per_shell_sc_ids:
-                continue
-
-            # OP2 by subcase dict
-            op2_by_sc = {}
-            for i, sc_id in enumerate(per_shell_sc_ids):
-                op2_by_sc[sc_id] = (
-                    per_shell_axial[i],
-                    per_shell_nx[i],
-                    per_shell_ny[i],
-                    per_shell_nxy[i],
-                )
-
-            n_shells_total = len(shell_info)
-
-            for et in element_types:
-                h5_subset = h5_data[h5_data[et_col] == et].copy() if et_col else h5_data
-
-                if h5_subset.empty:
-                    continue
-
-                # Subcase eslestirmesi
-                if sc_col is not None:
-                    matched_axial = []
-                    matched_nx = []
-                    matched_ny = []
-                    matched_nxy = []
-                    matched_h5_indices = []
-                    matched_sc_ids = []
-
-                    for idx, row in h5_subset.iterrows():
-                        h5_sc = int(row[sc_col])
-                        if h5_sc in op2_by_sc:
-                            ax, nx, ny, nxy = op2_by_sc[h5_sc]
-                            matched_axial.append(ax)
-                            matched_nx.append(nx)
-                            matched_ny.append(ny)
-                            matched_nxy.append(nxy)
-                            matched_h5_indices.append(idx)
-                            matched_sc_ids.append(h5_sc)
-
-                    if not matched_h5_indices:
-                        continue
-
-                    h5_matched = h5_subset.loc[matched_h5_indices].reset_index(drop=True)
-                    pred_axial = np.array(matched_axial)
-                    pred_nx = np.array(matched_nx)
-                    pred_ny = np.array(matched_ny)
-                    pred_nxy = np.array(matched_nxy)
-                else:
-                    h5_matched = h5_subset
-                    pred_axial = np.array(per_shell_axial)
-                    pred_nx = np.array(per_shell_nx)
-                    pred_ny = np.array(per_shell_ny)
-                    pred_nxy = np.array(per_shell_nxy)
-                    matched_sc_ids = list(per_shell_sc_ids)
-
-                result = per_shell_engine.compute_joint_correlation(
-                    bar_eid=bar_eid,
-                    subcase_id=0,
-                    element_type=int(et),
-                    bar_axial=pred_axial,
-                    avg_shell_nx=pred_nx,
-                    avg_shell_ny=pred_ny,
-                    avg_shell_nxy=pred_nxy,
-                    h5_data=h5_matched,
-                    n_shells=n_shells_total,
-                )
-                result.shell_eid = shell_eid
-                result.shell_type = shell_type_str
-                result.matched_subcases = matched_sc_ids
-                per_shell_results.append(result)
-
-                logger.info(
-                    "  Bar %d, Shell %d (%s), ET %s: %d denklem",
-                    bar_eid, shell_eid, shell_type_str, et, len(result.equations),
-                )
-
-    logger.info("Per-shell korelasyon: %d sonuc uretildi", len(per_shell_results))
-    return per_shell_results
 
 
 def main():
@@ -682,20 +544,6 @@ Ornek kullanim:
     logger.info("  %d korelasyon sonucu hesaplandi", len(correlation_results))
 
     # ============================================================
-    # ADIM 5b: Per-shell korelasyon analizi
-    # ============================================================
-    logger.info("-" * 40)
-    logger.info("ADIM 5b: Per-shell korelasyon analizi yapiliyor...")
-    per_shell_results = run_per_shell_correlation_analysis(
-        connectivity=connectivity,
-        bar_forces=bar_forces,
-        shell_forces=shell_forces,
-        h5_reader=h5_reader,
-        subcase_id=args.subcase,
-    )
-    logger.info("  %d per-shell korelasyon sonucu", len(per_shell_results))
-
-    # ============================================================
     # ADIM 6: Rapor oluştur
     # ============================================================
     logger.info("-" * 40)
@@ -713,7 +561,6 @@ Ornek kullanim:
         h5_joint_loads=h5_reader.joint_load_cap,
         correlation_results=correlation_results,
         correlation_summary_df=correlation_summary,
-        per_shell_results=per_shell_results,
     )
 
     # ============================================================

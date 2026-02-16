@@ -841,6 +841,7 @@ class JointCorrelationResult:
     subcase_id: int
     element_type: int  # H5 Element Type (0, 1, ...)
     n_connected_shells: int
+    shell_eids_used: List[int] = field(default_factory=list)
     shell_eid: Optional[int] = None       # Per-shell analiz icin shell element ID
     shell_type: Optional[str] = None      # Per-shell analiz icin shell tipi (CQUAD4, CTRIA3, ...)
     equations: List[RegressionEquation] = field(default_factory=list)
@@ -867,26 +868,46 @@ class CorrelationEngine:
         subcase_id: int,
         element_type: int,
         bar_axial: np.ndarray,
-        avg_shell_nx: np.ndarray,
-        avg_shell_ny: np.ndarray,
-        avg_shell_nxy: np.ndarray,
+        shell_forces_per_eid: Dict[int, Dict[str, np.ndarray]],
         h5_data: pd.DataFrame,
         n_shells: int,
     ) -> JointCorrelationResult:
-        """Coklu regresyon: Target = a1*Axial + a2*Nx + a3*Ny + a4*Nxy + b"""
+        """
+        Bar + per-shell kuvvetleri ile H5 hedefleri arasinda
+        coklu regresyon denklemi olusturur.
+
+        Parameters
+        ----------
+        bar_axial : np.ndarray
+            Bar axial force (n_subcases,).
+        shell_forces_per_eid : dict
+            {shell_eid: {"nx": array, "ny": array, "nxy": array}}
+            Her shell icin ayri kuvvet arrayleri (n_subcases,).
+        """
         logger = logging.getLogger(__name__)
+        sorted_shell_eids = sorted(shell_forces_per_eid.keys())
+
         result = JointCorrelationResult(
             bar_eid=bar_eid, subcase_id=subcase_id,
             element_type=element_type, n_connected_shells=n_shells,
+            shell_eids_used=sorted_shell_eids,
         )
 
-        predictors = {
-            "Bar_Axial": np.asarray(bar_axial, dtype=float),
-            "Shell_Nx": np.asarray(avg_shell_nx, dtype=float),
-            "Shell_Ny": np.asarray(avg_shell_ny, dtype=float),
-            "Shell_Nxy": np.asarray(avg_shell_nxy, dtype=float),
-        }
+        # Predictor verileri: Bar_Axial + per-shell Nx/Ny/Nxy
+        predictors = {"Bar_Axial": np.asarray(bar_axial, dtype=float)}
+        for seid in sorted_shell_eids:
+            sf = shell_forces_per_eid[seid]
+            predictors[f"Shell_{seid}_Nx"] = np.asarray(sf["nx"], dtype=float)
+            predictors[f"Shell_{seid}_Ny"] = np.asarray(sf["ny"], dtype=float)
+            predictors[f"Shell_{seid}_Nxy"] = np.asarray(sf["nxy"], dtype=float)
         result.predictor_data = predictors
+
+        n_predictors = len(predictors)
+        logger.info(
+            "Bar %d, ET %d: %d predictor (1 bar + %d shell x 3)",
+            bar_eid, element_type, n_predictors,
+            len(sorted_shell_eids),
+        )
 
         targets = {}
         for col in self.H5_TARGET_COLUMNS:
@@ -903,18 +924,31 @@ class CorrelationEngine:
 
         all_arrays = list(predictors.values()) + list(targets.values())
         min_len = min(len(a) for a in all_arrays)
-        if min_len < 5:
-            logger.warning("Bar %d: Yetersiz veri (%d)", bar_eid, min_len)
+
+        # Minimum veri noktasi: en az predictor sayisi + 1
+        min_required = max(5, n_predictors + 1)
+        if min_len < min_required:
+            logger.warning(
+                "Bar %d: Yetersiz veri noktasi (%d < %d gerekli), "
+                "regresyon atlaniyor (predictor=%d)",
+                bar_eid, min_len, min_required, n_predictors,
+            )
             self.results.append(result)
             return result
 
-        X_raw = np.column_stack([v[:min_len] for v in predictors.values()])
+        # Predictor matrisi: (n, 1 + 3*n_shells)
+        pred_names = list(predictors.keys())
+        X_raw = np.column_stack([predictors[k][:min_len] for k in pred_names])
 
         for target_name, target_arr in targets.items():
             y = target_arr[:min_len]
             valid = np.all(np.isfinite(X_raw), axis=1) & np.isfinite(y)
             n_valid = int(valid.sum())
-            if n_valid < 5:
+            if n_valid < min_required:
+                logger.debug(
+                    "Bar %d, %s: Yetersiz gecerli veri (%d < %d)",
+                    bar_eid, target_name, n_valid, min_required,
+                )
                 continue
 
             X = X_raw[valid]
@@ -934,20 +968,23 @@ class CorrelationEngine:
 
             eq = RegressionEquation(
                 target_name=target_name,
-                predictor_names=list(predictors.keys()),
+                predictor_names=pred_names,
                 coefficients=coeffs[:-1],
                 intercept=coeffs[-1],
                 r_squared=max(0.0, r_squared),
                 n_samples=n_valid,
             )
             result.equations.append(eq)
-            logger.info("Bar %d | %s | R²=%.4f | n=%d",
-                        bar_eid, eq.equation_str(), r_squared, n_valid)
+            logger.info(
+                "Bar %d | %s | R²=%.4f | n=%d | predictors=%d",
+                bar_eid, target_name, r_squared, n_valid, n_predictors,
+            )
 
         self.results.append(result)
         return result
 
     def get_summary_dataframe(self) -> pd.DataFrame:
+        """Tum korelasyon denklemlerini ozet DataFrame olarak dondur."""
         rows = []
         for res in self.results:
             for eq in res.equations:
@@ -956,6 +993,7 @@ class CorrelationEngine:
                     "Subcase_ID": res.subcase_id,
                     "Element_Type": res.element_type,
                     "N_Shells": res.n_connected_shells,
+                    "Shell_EIDs": ",".join(str(s) for s in res.shell_eids_used),
                     "Target": eq.target_name,
                     "R_Squared": eq.r_squared,
                     "N_Samples": eq.n_samples,
@@ -1155,13 +1193,13 @@ class ReportGenerator:
         header_fmt, number_fmt, int_fmt, border_fmt,
     ):
         """
-        Total Summary sheet'i - long format.
+        Total Summary sheet'i - long format, per-shell katsayilarla.
 
         Her hedef (target) icin ayri satir.
         Kolonlar:
-          Bar_EID | Element_Type | Subcase_ID | Shell_EID | Shell_Type |
-          Target | Coeff_Bar_Axial | Coeff_Shell_Nx | Coeff_Shell_Ny |
-          Coeff_Shell_Nxy | Intercept | R2
+          Bar_EID | Element_Type | Subcase_ID | N_Shells | Shell_EIDs |
+          Target | Coeff_Bar_Axial | Coeff_Shell_{EID1}_Nx | ... |
+          Intercept | R2
         """
         logger = logging.getLogger(__name__)
         rows = []
@@ -1170,8 +1208,8 @@ class ReportGenerator:
                 "Bar_EID": res.bar_eid,
                 "Element_Type": res.element_type,
                 "Subcase_ID": res.subcase_id,
-                "Shell_EID": res.shell_eid if res.shell_eid is not None else "",
-                "Shell_Type": res.shell_type if res.shell_type is not None else "",
+                "N_Shells": res.n_connected_shells,
+                "Shell_EIDs": ",".join(str(s) for s in res.shell_eids_used),
             }
 
             for eq in res.equations:
@@ -1195,18 +1233,15 @@ class ReportGenerator:
         for col_idx, col_name in enumerate(df.columns):
             ws.write(0, col_idx, col_name, header_fmt)
 
-        # Kolon genislikleri
+        # Kolon genislikleri: sabit kolonlar icin ozel, Coeff_* icin varsayilan
         col_widths = {
             "Bar_EID": 12,
             "Element_Type": 12,
             "Subcase_ID": 12,
-            "Shell_EID": 12,
-            "Shell_Type": 10,
+            "N_Shells": 10,
+            "Shell_EIDs": 20,
             "Target": 16,
             "Coeff_Bar_Axial": 16,
-            "Coeff_Shell_Nx": 16,
-            "Coeff_Shell_Ny": 16,
-            "Coeff_Shell_Nxy": 16,
             "Intercept": 14,
             "R2": 10,
         }
@@ -1229,8 +1264,8 @@ class ReportGenerator:
                 fmt = good_r2_fmt if val >= 0.7 else bad_r2_fmt
                 ws.write(row_idx + 1, r2_col_idx, val, fmt)
 
-        # Freeze panes: baslik satiri ve ilk 4 kolon sabit
-        ws.freeze_panes(1, 4)
+        # Freeze panes: baslik satiri ve ilk 5 kolon sabit
+        ws.freeze_panes(1, 5)
 
         logger.info("Total Summary: %d satir yazildi", len(rows))
 
@@ -1276,14 +1311,14 @@ class ReportGenerator:
                         "Element_Type": res.element_type,
                         "Subcase_ID": subcases[i] if i < len(subcases) else 0,
                         "Target": eq.target_name,
-                        "Bar_Axial": float(X[i, 0]) if X.shape[1] > 0 else 0,
-                        "Shell_Nx": float(X[i, 1]) if X.shape[1] > 1 else 0,
-                        "Shell_Ny": float(X[i, 2]) if X.shape[1] > 2 else 0,
-                        "Shell_Nxy": float(X[i, 3]) if X.shape[1] > 3 else 0,
-                        "Actual": actual_val,
-                        "Predicted": pred_val,
-                        "Error_%": error_pct,
                     }
+                    # Per-shell predictor degerleri
+                    for col_idx, pname in enumerate(pred_names):
+                        row[pname] = float(X[i, col_idx])
+
+                    row["Actual"] = actual_val
+                    row["Predicted"] = pred_val
+                    row["Error_%"] = error_pct
                     rows.append(row)
 
         if not rows:
@@ -1298,13 +1333,10 @@ class ReportGenerator:
         for col_idx, col_name in enumerate(df.columns):
             ws.write(0, col_idx, col_name, header_fmt)
 
-        ws.set_column(0, 0, 10)
-        ws.set_column(1, 1, 12)
-        ws.set_column(2, 2, 10)
-        ws.set_column(3, 3, 14)
-        ws.set_column(4, 7, 14)
-        ws.set_column(8, 9, 16)
-        ws.set_column(10, 10, 10)
+        # Kolon genislikleri: sabit kolonlar + dinamik predictor + sonuc kolonlari
+        for col_idx, col_name in enumerate(df.columns):
+            max_len = max(len(str(col_name)), 12)
+            ws.set_column(col_idx, col_idx, min(max_len + 2, 20))
 
         good_err_fmt = workbook.add_format({
             "num_format": "0.00", "border": 1, "bg_color": self.CORR_POS_COLOR,
@@ -1312,13 +1344,14 @@ class ReportGenerator:
         bad_err_fmt = workbook.add_format({
             "num_format": "0.00", "border": 1, "bg_color": self.CORR_NEG_COLOR,
         })
-        err_col_idx = list(df.columns).index("Error_%")
-        for row_idx, row_data in enumerate(rows):
-            err_val = abs(row_data["Error_%"])
-            if err_val <= 10:
-                ws.write(row_idx + 1, err_col_idx, row_data["Error_%"], good_err_fmt)
-            elif err_val > 25:
-                ws.write(row_idx + 1, err_col_idx, row_data["Error_%"], bad_err_fmt)
+        if "Error_%" in df.columns:
+            err_col_idx = list(df.columns).index("Error_%")
+            for row_idx, row_data in enumerate(rows):
+                err_val = abs(row_data["Error_%"])
+                if err_val <= 10:
+                    ws.write(row_idx + 1, err_col_idx, row_data["Error_%"], good_err_fmt)
+                elif err_val > 25:
+                    ws.write(row_idx + 1, err_col_idx, row_data["Error_%"], bad_err_fmt)
 
         logger.info("Predicted vs Actual: %d satir yazildi", len(rows))
 
@@ -1369,10 +1402,16 @@ class ReportGenerator:
                 row += 2
 
             for res in results:
+                # Predictor isimlerini ilk equation'dan al
+                pred_names = res.equations[0].predictor_names if res.equations else ["Bar_Axial"]
+                n_coeff_cols = len(pred_names)
+                merge_end = max(6, n_coeff_cols + 2)  # Target + coeffs + Intercept + R2
+
                 ws.write(row, 0, f"SC {res.subcase_id} ET {res.element_type}", header_fmt)
                 ws.merge_range(
-                    row, 0, row, 6,
-                    f"Multiple Regression (SC {res.subcase_id}, Element Type {res.element_type}, {res.n_connected_shells} shells)",
+                    row, 0, row, merge_end,
+                    f"Multiple Regression (SC {res.subcase_id}, Element Type {res.element_type}, "
+                    f"{res.n_connected_shells} shells, {n_coeff_cols} predictors)",
                     header_fmt,
                 )
                 row += 1
@@ -1382,10 +1421,12 @@ class ReportGenerator:
                     row += 2
                     continue
 
-                eq_headers = [
-                    "Target", "Coeff Bar_Axial", "Coeff Shell_Nx",
-                    "Coeff Shell_Ny", "Coeff Shell_Nxy", "Intercept", "R²",
-                ]
+                # Dinamik header: Target + Coeff per predictor + Intercept + R2
+                eq_headers = ["Target"]
+                for pname in pred_names:
+                    eq_headers.append(f"Coeff {pname}")
+                eq_headers.extend(["Intercept", "R²"])
+
                 for j, h in enumerate(eq_headers):
                     ws.write(row, j, h, header_fmt)
                 row += 1
@@ -1394,24 +1435,27 @@ class ReportGenerator:
                     ws.write(row, 0, eq.target_name, border_fmt)
                     for ci, coeff in enumerate(eq.coefficients):
                         ws.write(row, ci + 1, float(coeff), number_fmt)
-                    ws.write(row, 5, float(eq.intercept), number_fmt)
+                    intercept_col = len(eq.coefficients) + 1
+                    ws.write(row, intercept_col, float(eq.intercept), number_fmt)
+                    r2_col = intercept_col + 1
                     r2_fmt = good_r2_fmt if eq.r_squared >= 0.7 else number_fmt
-                    ws.write(row, 6, eq.r_squared, r2_fmt)
+                    ws.write(row, r2_col, eq.r_squared, r2_fmt)
                     row += 1
 
                 row += 1
 
                 ws.write(row, 0, "Equations", header_fmt)
-                ws.merge_range(row, 0, row, 6, "Equations", header_fmt)
+                ws.merge_range(row, 0, row, merge_end, "Equations", header_fmt)
                 row += 1
                 for eq in res.equations:
-                    ws.merge_range(row, 0, row, 6, eq.equation_str(), eq_fmt)
+                    ws.merge_range(row, 0, row, merge_end, eq.equation_str(), eq_fmt)
                     row += 1
                 row += 1
 
             ws.set_column(0, 0, 18)
-            ws.set_column(1, 5, 16)
-            ws.set_column(6, 6, 12)
+            max_col = max(6, n_coeff_cols + 2) if results else 6
+            ws.set_column(1, max_col - 1, 16)
+            ws.set_column(max_col, max_col, 12)
 
 
 # ============================================================
@@ -1431,19 +1475,26 @@ _TARGET_COL_MAP = {
     "NXY Bypass": "Pred_NXY",
 }
 
-# Cikti kolon sirasi
-_OUTPUT_COLUMNS = [
+# Cikti kolon sirasi (sabit kolonlar; per-shell kolonlar dinamik eklenir)
+_OUTPUT_FIXED_COLUMNS = [
     "Bar_EID", "Element_Type", "Subcase_ID",
-    "Bar_Axial", "Shell_Nx", "Shell_Ny", "Shell_Nxy", "N_Shells_Used",
+]
+_OUTPUT_PRED_COLUMNS = [
     "Pred_FX", "Pred_FY", "Pred_NX", "Pred_NY", "Pred_NXY",
 ]
 
 
 def _pred_order_output(df: pd.DataFrame) -> pd.DataFrame:
-    """Cikti kolon siralamasini duzenle."""
-    present = [c for c in _OUTPUT_COLUMNS if c in df.columns]
-    extra = [c for c in df.columns if c not in _OUTPUT_COLUMNS]
-    return df[present + extra]
+    """Cikti kolon siralamasini duzenle: sabit kolonlar + predictor'lar + prediction'lar."""
+    fixed = [c for c in _OUTPUT_FIXED_COLUMNS if c in df.columns]
+    pred_cols = [c for c in _OUTPUT_PRED_COLUMNS if c in df.columns]
+    # Per-shell predictor kolonlari (Bar_Axial, Shell_*_Nx, ...)
+    predictor_cols = [c for c in df.columns
+                      if c.startswith("Bar_Axial") or c.startswith("Shell_")]
+    # Kalan kolonlar
+    used = set(fixed + predictor_cols + pred_cols)
+    extra = [c for c in df.columns if c not in used]
+    return df[fixed + sorted(predictor_cols) + pred_cols + extra]
 
 
 def _pred_normalize_bar_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -1612,60 +1663,77 @@ def read_coefficients_from_excel(excel_path: str) -> pd.DataFrame:
             f"Mevcut kolonlar: {list(df.columns)}"
         )
 
-    # Katsayi kolonlarini numerik yap (string/NaN temizligi)
-    # Reporter startrow=1 ile yazdigi icin ilk satir tekrar kolon isimleri olabilir
-    numeric_cols = [
-        "Coeff_Bar_Axial", "Coeff_Shell_Nx", "Coeff_Shell_Ny",
-        "Coeff_Shell_Nxy", "Intercept",
-    ]
+    # Dinamik Coeff_* kolonlarini bul (per-shell: Coeff_Shell_XXXX_Nx, ...)
+    coeff_cols = [c for c in df.columns if c.startswith("Coeff_")]
+    numeric_cols = coeff_cols + ["Intercept"]
+
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     for col in ["Bar_EID", "Element_Type"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
+    # String satir temizligi: Bar_EID NaN olan satirlari at
     df = df.dropna(subset=["Bar_EID"])
     for col in numeric_cols:
         if col in df.columns:
             df[col] = df[col].fillna(0.0)
 
-    logger.info("  %d katsayi satiri okundu", len(df))
+    logger.info("  %d katsayi satiri okundu, %d Coeff kolonu",
+                len(df), len(coeff_cols))
+    logger.info("  Coeff kolonlari: %s", coeff_cols[:10])
+    logger.info("  Unique Bar_EID: %d", df["Bar_EID"].nunique())
     return df
 
 
-def _extract_connectivity_from_excel(excel_path: str) -> Dict[int, List[int]]:
-    """Total Summary sheet'inden bar_eid -> [shell_eids] eslesmesini cikar."""
+def _extract_shell_eids_from_coefficients(coeff_df: pd.DataFrame) -> Dict[int, List[int]]:
+    """
+    Katsayi DataFrame'inden bar_eid -> [shell_eids] eslesmesini cikar.
+
+    Iki kaynak:
+    1. Shell_EIDs kolonu (virgul ayirmali: "2001,2002,2003")
+    2. Coeff_Shell_XXXX_Nx kolon isimlerinden parse
+    """
+    import re
+
     logger = logging.getLogger(__name__)
-    logger.info("Connectivity bilgisi Excel'den cikariliyor...")
-    xls = pd.ExcelFile(excel_path)
+    shell_map = {}
 
-    for candidate in ["Total Summary"]:
-        if candidate in xls.sheet_names:
-            df = pd.read_excel(excel_path, sheet_name=candidate)
-            if "Bar_EID" in df.columns and "Shell_EID" in df.columns:
-                # Numerik temizlik (startrow=1 duplicate header sorunu)
-                df["Bar_EID"] = pd.to_numeric(df["Bar_EID"], errors="coerce")
-                df["Shell_EID"] = pd.to_numeric(df["Shell_EID"], errors="coerce")
-                df = df.dropna(subset=["Bar_EID", "Shell_EID"])
+    # Yontem 1: Shell_EIDs kolonu
+    if "Shell_EIDs" in coeff_df.columns:
+        for bar_eid, grp in coeff_df.groupby("Bar_EID"):
+            eids_str = grp.iloc[0].get("Shell_EIDs", "")
+            if pd.notna(eids_str) and str(eids_str).strip():
+                try:
+                    eids = [int(float(x.strip())) for x in str(eids_str).split(",") if x.strip()]
+                    if eids:
+                        shell_map[int(float(bar_eid))] = eids
+                except (ValueError, TypeError):
+                    pass
 
-                shell_map = {}
-                for bar_eid, group in df.groupby("Bar_EID"):
-                    shell_eids = []
-                    for s in group["Shell_EID"].dropna():
-                        try:
-                            shell_eids.append(int(float(s)))
-                        except (ValueError, TypeError):
-                            continue
-                    if shell_eids:
-                        try:
-                            shell_map[int(float(bar_eid))] = list(set(shell_eids))
-                        except (ValueError, TypeError):
-                            continue
-                logger.info("  %d bar element icin connectivity bulundu", len(shell_map))
-                return shell_map
+    # Yontem 2: Coeff_Shell_XXXX_Nx kolon isimlerinden
+    if not shell_map:
+        shell_eid_pattern = re.compile(r"Coeff_Shell_(\d+)_N[xXyY]+")
+        all_shell_eids = set()
+        for col in coeff_df.columns:
+            m = shell_eid_pattern.match(col)
+            if m:
+                all_shell_eids.add(int(m.group(1)))
 
-    logger.warning("Excel'den connectivity bilgisi cikarilmadi")
-    return {}
+        if all_shell_eids:
+            # Her bar icin: sadece degeri NaN olmayan shell EID'leri
+            for bar_eid, grp in coeff_df.groupby("Bar_EID"):
+                row = grp.iloc[0]
+                eids = []
+                for seid in sorted(all_shell_eids):
+                    col_nx = f"Coeff_Shell_{seid}_Nx"
+                    if col_nx in row.index and pd.notna(row.get(col_nx)):
+                        eids.append(seid)
+                if eids:
+                    shell_map[int(float(bar_eid))] = eids
+
+    logger.info("  %d bar element icin shell connectivity bulundu", len(shell_map))
+    return shell_map
 
 
 def predict_from_h5(
@@ -1690,11 +1758,11 @@ def predict_from_h5(
         logger.error("Prediction H5'te shell force verisi bulunamadi")
         return pd.DataFrame()
 
-    # 3. Connectivity: BDF'den geldiyse kullan, yoksa Excel'den cikar
+    # 3. Shell EID'leri: BDF'den geldiyse kullan, yoksa katsayilardan cikar
     if connectivity:
         shell_eid_map = _build_shell_eid_map(connectivity)
     else:
-        shell_eid_map = _extract_connectivity_from_excel(coefficients_excel)
+        shell_eid_map = _extract_shell_eids_from_coefficients(coeff_df)
 
     return _run_prediction(coeff_df, bar_df, shell_df, output_csv, shell_eid_map)
 
@@ -1720,8 +1788,10 @@ def predict_from_results(
 ) -> pd.DataFrame:
     """
     In-memory korelasyon sonuclariyla tahmin (Predicted vs Actual mantigi).
-    correlation_results kullanir (ortalama shell kuvvetleri ile regresyon).
-    Her (bar_eid, element_type) icin TEK sonuc satirlari uretir.
+
+    Per-shell predictor'lar kullanir:
+      X = [Bar_Axial, Shell_{EID1}_Nx, Shell_{EID1}_Ny, Shell_{EID1}_Nxy, ...]
+      predicted = X @ coefficients + intercept
     """
     logger = logging.getLogger(__name__)
     rows = []
@@ -1729,9 +1799,6 @@ def predict_from_results(
     for res in correlation_results:
         if not res.equations or not res.predictor_data:
             continue
-
-        bar_eid = res.bar_eid
-        element_type = res.element_type
 
         pred_names = list(res.predictor_data.keys())
         n = min(len(v) for v in res.predictor_data.values())
@@ -1744,15 +1811,14 @@ def predict_from_results(
         for i in range(n):
             sc_id = subcases[i] if i < len(subcases) else 0
             row = {
-                "Bar_EID": bar_eid,
-                "Element_Type": element_type,
+                "Bar_EID": res.bar_eid,
+                "Element_Type": res.element_type,
                 "Subcase_ID": sc_id,
-                "Bar_Axial": float(X[i, 0]) if X.shape[1] > 0 else 0.0,
-                "Shell_Nx": float(X[i, 1]) if X.shape[1] > 1 else 0.0,
-                "Shell_Ny": float(X[i, 2]) if X.shape[1] > 2 else 0.0,
-                "Shell_Nxy": float(X[i, 3]) if X.shape[1] > 3 else 0.0,
-                "N_Shells_Used": res.n_connected_shells,
             }
+            # Per-shell predictor degerleri
+            for col_idx, pname in enumerate(pred_names):
+                row[pname] = float(X[i, col_idx])
+
             for eq in res.equations:
                 predicted = float(X[i] @ eq.coefficients + eq.intercept)
                 col_name = _TARGET_COL_MAP.get(
@@ -1760,6 +1826,7 @@ def predict_from_results(
                     f"Pred_{eq.target_name.replace(' ', '_')}"
                 )
                 row[col_name] = predicted
+
             rows.append(row)
 
     if not rows:
@@ -1805,11 +1872,14 @@ def _run_prediction(
     shell_eid_map: Dict[int, List[int]] = None,
 ) -> pd.DataFrame:
     """
-    Predicted vs Actual mantigi ile birebir ayni tahmin.
-      predictor = [bar_axial(AF), avg_shell_nx, avg_shell_ny, avg_shell_nxy]
+    Per-shell katsayilarla tahmin.
+
+    Her (bar_eid, element_type, subcase) icin:
+      predictor = [Bar_Axial, Shell_{EID1}_Nx, Shell_{EID1}_Ny, Shell_{EID1}_Nxy, ...]
       predicted = predictor @ coefficients + intercept
-    Tum bagli shell'lerin NX/NY/NXY ortalamasi alinir.
-    Cikti wide format: Bar_EID, Element_Type, Subcase_ID, Pred_FX, Pred_FY, Pred_NX, Pred_NY, Pred_NXY
+
+    shell_eid_map: bar_eid -> [shell_eids] (katsayilardan veya BDF'den)
+    Her shell'in AYRI NX/NY/NXY degeri kullanilir, ortalama ALINMAZ.
     """
     if shell_eid_map is None:
         shell_eid_map = {}
@@ -1818,71 +1888,95 @@ def _run_prediction(
     bar_df = _pred_normalize_bar_df(bar_df)
     shell_df = _pred_normalize_shell_df(shell_df)
 
-    logger.info("Prediction engine: bar %d satir, shell %d satir, coeff %d satir",
+    logger.info("Prediction engine (per-shell): bar %d, shell %d, coeff %d",
                 len(bar_df), len(shell_df), len(coeff_df))
 
     rows = []
     groups = coeff_df.groupby(["Bar_EID", "Element_Type"])
 
     for (bar_eid, et), group in groups:
-        eq_map = {}
-        for _, coeff_row in group.iterrows():
-            target = coeff_row["Target"]
-            eq_map[target] = {
-                "coeffs": np.array([
-                    coeff_row.get("Coeff_Bar_Axial", 0),
-                    coeff_row.get("Coeff_Shell_Nx", 0),
-                    coeff_row.get("Coeff_Shell_Ny", 0),
-                    coeff_row.get("Coeff_Shell_Nxy", 0),
-                ], dtype=float),
-                "intercept": float(coeff_row.get("Intercept", 0)),
-            }
+        bar_eid_int = int(float(bar_eid))
+        et_int = int(float(et))
 
-        bar_mask = bar_df["bar_eid"] == int(bar_eid)
-        bar_subset = bar_df[bar_mask]
-        if bar_subset.empty:
-            continue
-
-        connected_shells = shell_eid_map.get(int(bar_eid), [])
+        # Bu bar icin bagli shell EID'leri
+        connected_shells = shell_eid_map.get(bar_eid_int, [])
         if not connected_shells:
-            logger.debug("Bar %d: Bagli shell bilgisi yok, atlaniyor", bar_eid)
+            logger.debug("Bar %d: shell connectivity yok, atlaniyor", bar_eid_int)
             continue
 
+        # Her target icin katsayi vektorunu hazirla
+        # Kolon sirasi: Coeff_Bar_Axial, Coeff_Shell_{EID}_Nx, ..._Ny, ..._Nxy, ...
+        eq_list = []
+        for _, crow in group.iterrows():
+            target = str(crow["Target"])
+            intercept = float(crow.get("Intercept", 0.0) or 0.0)
+
+            # Katsayi vektoru olustur: [Bar_Axial, Shell1_Nx, Shell1_Ny, Shell1_Nxy, ...]
+            coeffs = [float(crow.get("Coeff_Bar_Axial", 0.0) or 0.0)]
+            for seid in sorted(connected_shells):
+                coeffs.append(float(crow.get(f"Coeff_Shell_{seid}_Nx", 0.0) or 0.0))
+                coeffs.append(float(crow.get(f"Coeff_Shell_{seid}_Ny", 0.0) or 0.0))
+                coeffs.append(float(crow.get(f"Coeff_Shell_{seid}_Nxy", 0.0) or 0.0))
+
+            eq_list.append((target, np.array(coeffs, dtype=float), intercept))
+
+        # Bar AF verileri
+        bar_subset = bar_df[bar_df["bar_eid"] == bar_eid_int]
+        if bar_subset.empty:
+            bar_subset = bar_df[bar_df["bar_eid"] == float(bar_eid_int)]
+        if bar_subset.empty:
+            logger.debug("Bar %d: H5 bar verisi yok", bar_eid_int)
+            continue
+
+        # Her subcase icin tahmin
         for _, bar_row in bar_subset.iterrows():
             sc_id = bar_row["subcase_id"]
             af = float(bar_row["af"])
 
-            shell_sc_data = shell_df[
-                (shell_df["element_id"].isin(connected_shells)) &
-                (shell_df["subcase_id"] == sc_id)
-            ]
-            if shell_sc_data.empty:
+            # Her shell'in AYRI NX/NY/NXY degerini al
+            predictor = [af]
+            predictor_info = {"Bar_Axial": af}
+            all_found = True
+
+            for seid in sorted(connected_shells):
+                shell_row = shell_df[
+                    (shell_df["element_id"] == seid) &
+                    (shell_df["subcase_id"] == sc_id)
+                ]
+                if shell_row.empty:
+                    # Float karsilastirma dene
+                    shell_row = shell_df[
+                        (shell_df["element_id"] == float(seid)) &
+                        (shell_df["subcase_id"].between(sc_id - 0.5, sc_id + 0.5))
+                    ]
+                if shell_row.empty:
+                    all_found = False
+                    break
+
+                nx_val = float(shell_row["nx"].iloc[0])
+                ny_val = float(shell_row["ny"].iloc[0])
+                nxy_val = float(shell_row["nxy"].iloc[0])
+                predictor.extend([nx_val, ny_val, nxy_val])
+                predictor_info[f"Shell_{seid}_Nx"] = nx_val
+                predictor_info[f"Shell_{seid}_Ny"] = ny_val
+                predictor_info[f"Shell_{seid}_Nxy"] = nxy_val
+
+            if not all_found:
                 continue
 
-            avg_nx = float(shell_sc_data["nx"].mean())
-            avg_ny = float(shell_sc_data["ny"].mean())
-            avg_nxy = float(shell_sc_data["nxy"].mean())
-
-            predictor = np.array([af, avg_nx, avg_ny, avg_nxy])
-
-            n_shells_used = len(shell_sc_data)
+            predictor_arr = np.array(predictor, dtype=float)
 
             row = {
-                "Bar_EID": int(bar_eid),
-                "Element_Type": int(et),
-                "Subcase_ID": int(sc_id),
-                "Bar_Axial": af,
-                "Shell_Nx": avg_nx,
-                "Shell_Ny": avg_ny,
-                "Shell_Nxy": avg_nxy,
-                "N_Shells_Used": n_shells_used,
+                "Bar_EID": bar_eid_int,
+                "Element_Type": et_int,
+                "Subcase_ID": int(float(sc_id)),
             }
+            row.update(predictor_info)
 
-            for target_name, eq_info in eq_map.items():
-                predicted = float(predictor @ eq_info["coeffs"] + eq_info["intercept"])
+            for target, coeffs, intercept in eq_list:
+                predicted = float(predictor_arr @ coeffs + intercept)
                 col_name = _TARGET_COL_MAP.get(
-                    target_name,
-                    f"Pred_{target_name.replace(' ', '_')}"
+                    target, f"Pred_{target.replace(' ', '_')}"
                 )
                 row[col_name] = predicted
 
@@ -2016,11 +2110,15 @@ def run_correlation_analysis(
     h5_reader: H5Reader,
     subcase_id: int = None,
 ) -> Tuple[CorrelationEngine, List[JointCorrelationResult]]:
-    """Korelasyon analizini calistir.
+    """
+    Korelasyon analizini calistir.
 
     Her bar element + element type icin TUM SUBCASE'LER uzerinden
-    veri toplayarak coklu regresyon denklemi olusturur:
-      Target = a1*Bar_Axial + a2*Shell_Nx + a3*Shell_Ny + a4*Shell_Nxy + b
+    per-shell kuvvetlerle coklu regresyon denklemi olusturur:
+      Target = a0*Bar_Axial
+             + a1*Shell_{EID1}_Nx + a2*Shell_{EID1}_Ny + a3*Shell_{EID1}_Nxy
+             + a4*Shell_{EID2}_Nx + ...
+             + intercept
     """
     logger = logging.getLogger(__name__)
     engine = CorrelationEngine()
@@ -2039,65 +2137,78 @@ def run_correlation_analysis(
             logger.warning("Bar %d icin OP2 kuvvet verisi yok", bar_eid)
             continue
 
+        # Bagli shell EID listesi
         shell_eids = list(info.connected_quads.keys()) + list(info.connected_trias.keys())
 
-        # OP2 verilerini TUM subcase'ler uzerinden topla
-        collected_sc_ids = []
-        collected_axial = []
-        collected_avg_nx = []
-        collected_avg_ny = []
-        collected_avg_nxy = []
-
+        # ---- Per-shell veri toplama ----
+        # Once bar verisi olan subcase'leri belirle
+        valid_sc_keys = []
         for sc_id_key, _ in sc_keys:
             if subcase_id is not None and sc_id_key != subcase_id:
                 continue
-
             bar_result = bar_forces.get((sc_id_key, bar_eid))
-            if bar_result is None:
-                continue
+            if bar_result is not None:
+                valid_sc_keys.append(sc_id_key)
 
-            shell_nx, shell_ny, shell_nxy = [], [], []
-            for seid in shell_eids:
-                sf = shell_forces.get((sc_id_key, seid))
-                if sf is not None:
-                    shell_nx.append(sf.membrane_x)
-                    shell_ny.append(sf.membrane_y)
-                    shell_nxy.append(sf.membrane_xy)
-
-            if not shell_nx:
-                continue
-
-            axial_mean = np.mean(bar_result.axial_force)
-            avg_nx_mean = np.mean(np.mean(shell_nx, axis=0))
-            avg_ny_mean = np.mean(np.mean(shell_ny, axis=0))
-            avg_nxy_mean = np.mean(np.mean(shell_nxy, axis=0))
-
-            collected_sc_ids.append(sc_id_key)
-            collected_axial.append(axial_mean)
-            collected_avg_nx.append(avg_nx_mean)
-            collected_avg_ny.append(avg_ny_mean)
-            collected_avg_nxy.append(avg_nxy_mean)
-
-        if not collected_sc_ids:
-            logger.warning("Bar %d: Hicbir subcase icin veri toplanamadi", bar_eid)
+        if not valid_sc_keys:
+            logger.warning("Bar %d: Hicbir subcase icin bar verisi yok", bar_eid)
             continue
 
-        n_shells = len([s for s in shell_eids
-                        if shell_forces.get((collected_sc_ids[0], s)) is not None])
+        # Tum subcase'lerde verisi olan shell'leri bul
+        shells_with_full_data = []
+        for seid in shell_eids:
+            has_all = all(
+                shell_forces.get((sc_id, seid)) is not None
+                for sc_id in valid_sc_keys
+            )
+            if has_all:
+                shells_with_full_data.append(seid)
 
-        logger.info("  Bar %d: %d subcase, %d shell uzerinden veri toplandi",
-                     bar_eid, len(collected_sc_ids), n_shells)
+        if not shells_with_full_data:
+            logger.warning("Bar %d: Hicbir shell tum subcase'lerde veri yok", bar_eid)
+            continue
 
-        # OP2 verilerini subcase_id'ye gore dict'e koy (eslestirme icin)
+        # Per-shell veri toplama
+        collected_sc_ids = []
+        collected_axial = []
+        # {shell_eid: {"nx": [], "ny": [], "nxy": []}}
+        collected_shell = {
+            seid: {"nx": [], "ny": [], "nxy": []}
+            for seid in shells_with_full_data
+        }
+
+        for sc_id in valid_sc_keys:
+            bar_result = bar_forces.get((sc_id, bar_eid))
+            axial_mean = np.mean(bar_result.axial_force)
+
+            collected_sc_ids.append(sc_id)
+            collected_axial.append(axial_mean)
+
+            for seid in shells_with_full_data:
+                sf = shell_forces.get((sc_id, seid))
+                collected_shell[seid]["nx"].append(np.mean(sf.membrane_x))
+                collected_shell[seid]["ny"].append(np.mean(sf.membrane_y))
+                collected_shell[seid]["nxy"].append(np.mean(sf.membrane_xy))
+
+        n_shells = len(shells_with_full_data)
+        logger.info(
+            "  Bar %d: %d subcase, %d shell (per-shell predictor)",
+            bar_eid, len(collected_sc_ids), n_shells,
+        )
+
+        # OP2 verilerini subcase_id'ye gore dict'e koy (H5 eslestirme icin)
         op2_by_sc = {}
         for i, sc_id in enumerate(collected_sc_ids):
-            op2_by_sc[sc_id] = (
-                collected_axial[i],
-                collected_avg_nx[i],
-                collected_avg_ny[i],
-                collected_avg_nxy[i],
-            )
+            sc_data = {"axial": collected_axial[i], "shells": {}}
+            for seid in shells_with_full_data:
+                sc_data["shells"][seid] = {
+                    "nx": collected_shell[seid]["nx"][i],
+                    "ny": collected_shell[seid]["ny"][i],
+                    "nxy": collected_shell[seid]["nxy"][i],
+                }
+            op2_by_sc[sc_id] = sc_data
 
+        # Element Type'a gore grupla
         et_col = _find_element_type_col(h5_data)
         if et_col is not None:
             element_types = sorted(h5_data[et_col].unique())
@@ -2119,31 +2230,31 @@ def run_correlation_analysis(
             # --- Subcase ID eslestirmesi ---
             if sc_col is not None:
                 matched_axial = []
-                matched_nx = []
-                matched_ny = []
-                matched_nxy = []
+                matched_shell = {
+                    seid: {"nx": [], "ny": [], "nxy": []}
+                    for seid in shells_with_full_data
+                }
                 matched_h5_indices = []
                 matched_sc_ids = []
 
                 for idx, row in h5_subset.iterrows():
                     h5_sc = int(row[sc_col])
                     if h5_sc in op2_by_sc:
-                        ax, nx, ny, nxy = op2_by_sc[h5_sc]
-                        matched_axial.append(ax)
-                        matched_nx.append(nx)
-                        matched_ny.append(ny)
-                        matched_nxy.append(nxy)
+                        sc_data = op2_by_sc[h5_sc]
+                        matched_axial.append(sc_data["axial"])
+                        for seid in shells_with_full_data:
+                            matched_shell[seid]["nx"].append(sc_data["shells"][seid]["nx"])
+                            matched_shell[seid]["ny"].append(sc_data["shells"][seid]["ny"])
+                            matched_shell[seid]["nxy"].append(sc_data["shells"][seid]["nxy"])
                         matched_h5_indices.append(idx)
                         matched_sc_ids.append(h5_sc)
 
                 n_matched = len(matched_h5_indices)
                 n_h5_total = len(h5_subset)
-                n_op2_total = len(collected_sc_ids)
 
                 logger.info(
-                    "  Bar %d, ET %s: %d/%d H5 satir OP2 ile eslesti "
-                    "(H5: %d satir, OP2: %d subcase)",
-                    bar_eid, et, n_matched, n_h5_total, n_h5_total, n_op2_total,
+                    "  Bar %d, ET %s: %d/%d H5 satir OP2 ile eslesti",
+                    bar_eid, et, n_matched, n_h5_total,
                 )
 
                 if not matched_h5_indices:
@@ -2158,10 +2269,16 @@ def run_correlation_analysis(
 
                 h5_matched = h5_subset.loc[matched_h5_indices].reset_index(drop=True)
                 pred_axial = np.array(matched_axial)
-                pred_nx = np.array(matched_nx)
-                pred_ny = np.array(matched_ny)
-                pred_nxy = np.array(matched_nxy)
+                shell_forces_per_eid = {
+                    seid: {
+                        "nx": np.array(matched_shell[seid]["nx"]),
+                        "ny": np.array(matched_shell[seid]["ny"]),
+                        "nxy": np.array(matched_shell[seid]["nxy"]),
+                    }
+                    for seid in shells_with_full_data
+                }
             else:
+                # Subcase kolonu yoksa sirali eslestirme
                 logger.warning(
                     "  Bar %d: H5'te Subcase ID kolonu bulunamadi, "
                     "sirali eslestirme yapiliyor",
@@ -2169,9 +2286,14 @@ def run_correlation_analysis(
                 )
                 h5_matched = h5_subset
                 pred_axial = np.array(collected_axial)
-                pred_nx = np.array(collected_avg_nx)
-                pred_ny = np.array(collected_avg_ny)
-                pred_nxy = np.array(collected_avg_nxy)
+                shell_forces_per_eid = {
+                    seid: {
+                        "nx": np.array(collected_shell[seid]["nx"]),
+                        "ny": np.array(collected_shell[seid]["ny"]),
+                        "nxy": np.array(collected_shell[seid]["nxy"]),
+                    }
+                    for seid in shells_with_full_data
+                }
                 matched_sc_ids = list(collected_sc_ids)
 
             logger.info("  Bar %d, ElementType %s, %d eslesen veri noktasi",
@@ -2182,9 +2304,7 @@ def run_correlation_analysis(
                 subcase_id=0,
                 element_type=int(et),
                 bar_axial=pred_axial,
-                avg_shell_nx=pred_nx,
-                avg_shell_ny=pred_ny,
-                avg_shell_nxy=pred_nxy,
+                shell_forces_per_eid=shell_forces_per_eid,
                 h5_data=h5_matched,
                 n_shells=n_shells,
             )
@@ -2204,8 +2324,8 @@ def run_per_shell_correlation_analysis(
     """
     Her bagli shell element icin AYRI AYRI korelasyon analizi calistir.
 
-    Ortalama almak yerine, her shell element icin bireysel regresyon:
-      Target = a1*Bar_Axial + a2*Shell_Nx + a3*Shell_Ny + a4*Shell_Nxy + b
+    Her shell element icin bireysel regresyon (tek shell predictor ile):
+      Target = a1*Bar_Axial + a2*Shell_{EID}_Nx + a3*Shell_{EID}_Ny + a4*Shell_{EID}_Nxy + b
     """
     logger = logging.getLogger(__name__)
     per_shell_engine = CorrelationEngine()
@@ -2267,12 +2387,12 @@ def run_per_shell_correlation_analysis(
 
             op2_by_sc = {}
             for i, sc_id in enumerate(per_shell_sc_ids):
-                op2_by_sc[sc_id] = (
-                    per_shell_axial[i],
-                    per_shell_nx[i],
-                    per_shell_ny[i],
-                    per_shell_nxy[i],
-                )
+                op2_by_sc[sc_id] = {
+                    "axial": per_shell_axial[i],
+                    "nx": per_shell_nx[i],
+                    "ny": per_shell_ny[i],
+                    "nxy": per_shell_nxy[i],
+                }
 
             n_shells_total = len(shell_info)
 
@@ -2292,11 +2412,11 @@ def run_per_shell_correlation_analysis(
                     for idx, row in h5_subset.iterrows():
                         h5_sc = int(row[sc_col])
                         if h5_sc in op2_by_sc:
-                            ax, nx, ny, nxy = op2_by_sc[h5_sc]
-                            matched_axial.append(ax)
-                            matched_nx.append(nx)
-                            matched_ny.append(ny)
-                            matched_nxy.append(nxy)
+                            sc_data = op2_by_sc[h5_sc]
+                            matched_axial.append(sc_data["axial"])
+                            matched_nx.append(sc_data["nx"])
+                            matched_ny.append(sc_data["ny"])
+                            matched_nxy.append(sc_data["nxy"])
                             matched_h5_indices.append(idx)
                             matched_sc_ids.append(h5_sc)
 
@@ -2305,15 +2425,23 @@ def run_per_shell_correlation_analysis(
 
                     h5_matched = h5_subset.loc[matched_h5_indices].reset_index(drop=True)
                     pred_axial = np.array(matched_axial)
-                    pred_nx = np.array(matched_nx)
-                    pred_ny = np.array(matched_ny)
-                    pred_nxy = np.array(matched_nxy)
+                    single_shell_forces = {
+                        shell_eid: {
+                            "nx": np.array(matched_nx),
+                            "ny": np.array(matched_ny),
+                            "nxy": np.array(matched_nxy),
+                        }
+                    }
                 else:
                     h5_matched = h5_subset
                     pred_axial = np.array(per_shell_axial)
-                    pred_nx = np.array(per_shell_nx)
-                    pred_ny = np.array(per_shell_ny)
-                    pred_nxy = np.array(per_shell_nxy)
+                    single_shell_forces = {
+                        shell_eid: {
+                            "nx": np.array(per_shell_nx),
+                            "ny": np.array(per_shell_ny),
+                            "nxy": np.array(per_shell_nxy),
+                        }
+                    }
                     matched_sc_ids = list(per_shell_sc_ids)
 
                 result = per_shell_engine.compute_joint_correlation(
@@ -2321,9 +2449,7 @@ def run_per_shell_correlation_analysis(
                     subcase_id=0,
                     element_type=int(et),
                     bar_axial=pred_axial,
-                    avg_shell_nx=pred_nx,
-                    avg_shell_ny=pred_ny,
-                    avg_shell_nxy=pred_nxy,
+                    shell_forces_per_eid=single_shell_forces,
                     h5_data=h5_matched,
                     n_shells=n_shells_total,
                 )

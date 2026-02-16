@@ -50,7 +50,7 @@ class ReportGenerator:
         h5_joint_loads: pd.DataFrame,
         correlation_results: List[JointCorrelationResult],
         correlation_summary_df: pd.DataFrame,
-        per_shell_results: Optional[List[JointCorrelationResult]] = None,
+        per_shell_results: Optional[List[JointCorrelationResult]] = None,  # deprecated, artik kullanilmiyor
     ) -> str:
         """
         Tam raporu oluştur.
@@ -127,10 +127,10 @@ class ReportGenerator:
                 header_fmt, number_fmt, int_fmt, border_fmt,
             )
 
-            # 8. Total Summary - tum bar elementler icin tek tablo (per-shell)
+            # 8. Total Summary - tum bar elementler icin tek tablo
             self._write_total_summary(
                 writer, workbook, connectivity,
-                per_shell_results if per_shell_results else correlation_results,
+                correlation_results,
                 header_fmt, number_fmt, int_fmt, border_fmt,
             )
 
@@ -259,12 +259,13 @@ class ReportGenerator:
         """
         rows = []
         for res in correlation_results:
+            shell_eids_str = ",".join(str(s) for s in res.shell_eids_used) if res.shell_eids_used else ""
             base = {
                 "Bar_EID": res.bar_eid,
                 "Element_Type": res.element_type,
                 "Subcase_ID": res.subcase_id,
-                "Shell_EID": res.shell_eid if res.shell_eid is not None else "",
-                "Shell_Type": res.shell_type if res.shell_type is not None else "",
+                "N_Shells": res.n_connected_shells,
+                "Shell_EIDs": shell_eids_str,
             }
 
             for eq in res.equations:
@@ -331,7 +332,7 @@ class ReportGenerator:
         self, writer, workbook, correlation_results,
         header_fmt, number_fmt, int_fmt, border_fmt,
     ):
-        """Predicted vs Actual sheet'i - her subcase icin tahmin ve hata orani."""
+        """Predicted vs Actual sheet'i - per-shell predictor'lar ile."""
         rows = []
 
         for res in correlation_results:
@@ -368,14 +369,14 @@ class ReportGenerator:
                         "Element_Type": res.element_type,
                         "Subcase_ID": subcases[i] if i < len(subcases) else 0,
                         "Target": eq.target_name,
-                        "Bar_Axial": float(X[i, 0]) if X.shape[1] > 0 else 0,
-                        "Shell_Nx": float(X[i, 1]) if X.shape[1] > 1 else 0,
-                        "Shell_Ny": float(X[i, 2]) if X.shape[1] > 2 else 0,
-                        "Shell_Nxy": float(X[i, 3]) if X.shape[1] > 3 else 0,
-                        "Actual": actual_val,
-                        "Predicted": pred_val,
-                        "Error_%": error_pct,
                     }
+                    # Per-shell predictor degerleri
+                    for col_idx_p, pname in enumerate(pred_names):
+                        row[pname] = float(X[i, col_idx_p])
+
+                    row["Actual"] = actual_val
+                    row["Predicted"] = pred_val
+                    row["Error_%"] = error_pct
                     rows.append(row)
 
         if not rows:
@@ -391,15 +392,19 @@ class ReportGenerator:
             ws.write(0, col_idx, col_name, header_fmt)
 
         # Kolon genislikleri
+        n_cols = len(df.columns)
         ws.set_column(0, 0, 10)   # Bar_EID
         ws.set_column(1, 1, 12)   # Element_Type
         ws.set_column(2, 2, 10)   # Subcase_ID
         ws.set_column(3, 3, 14)   # Target
-        ws.set_column(4, 7, 14)   # predictor degerleri
-        ws.set_column(8, 9, 16)   # Actual, Predicted
-        ws.set_column(10, 10, 10) # Error_%
+        # Per-shell predictor kolonlari (degisken sayida)
+        pred_end = 4 + len([c for c in df.columns if c.startswith("Bar_") or c.startswith("Shell_")])
+        ws.set_column(4, pred_end, 16)
+        # Actual, Predicted, Error_%
+        ws.set_column(n_cols - 3, n_cols - 2, 16)
+        ws.set_column(n_cols - 1, n_cols - 1, 10)
 
-        # Error % renklendirme: iyi (<10%) yesil, kotu (>25%) kirmizi
+        # Error % renklendirme
         good_err_fmt = workbook.add_format({
             "num_format": "0.00", "border": 1, "bg_color": self.CORR_POS_COLOR,
         })
